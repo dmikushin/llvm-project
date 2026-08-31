@@ -626,7 +626,7 @@ struct ParamType {
                     k == 8,
                 "Unsupported integer kind");
   static_assert(t != ParamTypeId::Real || k == 4 || k == 8 || k == 10 ||
-                    k == 16,
+                    k == 16 || k == 32,
                 "Unsupported real kind");
   static_assert(t != ParamTypeId::Complex || k == 2 || k == 3 || k == 4 ||
                     k == 8 || k == 10 || k == 16,

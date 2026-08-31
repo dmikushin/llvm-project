@@ -1189,6 +1189,72 @@ GENBIN(Divide, Integer, mlir::arith::DivSIOp)
 GENBIN(Divide, Unsigned, mlir::arith::DivUIOp)
 GENBIN(Divide, Real, mlir::arith::DivFOp)
 
+/// Emit a call into liboctamath for an operation on REAL(32).
+///
+/// REAL(32) is carried as an opaque i256 (see genRealType in ConvertType.cpp),
+/// so it cannot use the arith dialect at all: arith's floating point
+/// operations constrain their operands to FloatLike, and i256 is not. The
+/// escape route is the one COMPLEX already takes on the line above - it does
+/// not use arith either, it uses FIR-owned operations - except that here there
+/// is nothing to lower to in the backend, so the operation *is* the call.
+///
+/// The library takes and returns by pointer:
+///     int octa_add(octa_t *r, const octa_t *a, const octa_t *b, octa_rnd_t);
+/// so each operand is spilled to an alloca and the result read back from one.
+/// That is the standardised aggregate ABI - a 32 byte object passed by
+/// reference - and deliberately not a 256 bit scalar, for which the x86-64
+/// psABI defines no class at all.
+static mlir::Value genOctaCall(mlir::Location loc, fir::FirOpBuilder &builder,
+                               llvm::StringRef name,
+                               llvm::ArrayRef<mlir::Value> args) {
+  mlir::Type i256 = builder.getIntegerType(256);
+  mlir::Type ref = fir::ReferenceType::get(i256);
+  mlir::Type i32 = builder.getI32Type();
+
+  llvm::SmallVector<mlir::Type> argTys(args.size() + 1, ref);
+  argTys.push_back(i32);
+  mlir::func::FuncOp fn =
+      builder.createFunction(loc, name, builder.getFunctionType(argTys, {i32}));
+
+  mlir::Value result = fir::AllocaOp::create(builder, loc, i256);
+  llvm::SmallVector<mlir::Value> operands;
+  operands.push_back(result);
+  for (mlir::Value a : args) {
+    mlir::Value slot = fir::AllocaOp::create(builder, loc, i256);
+    fir::StoreOp::create(builder, loc, a, slot);
+    operands.push_back(slot);
+  }
+  // OCTA_RND_NEAREST_EVEN. Fortran has no way to select another mode for an
+  // ordinary expression, and IEEE_SET_ROUNDING_MODE is not wired up here.
+  operands.push_back(builder.createIntegerConstant(loc, i32, 0));
+
+  // The status word is discarded. That is a real gap, not an oversight: the
+  // library reports IEEE flags plus OCTA_ZIV_EXHAUSTED per call, and nothing
+  // yet carries them to IEEE_GET_FLAGS. Recorded rather than hidden.
+  fir::CallOp::create(builder, loc, fn, operands);
+  return fir::LoadOp::create(builder, loc, result);
+}
+
+#define GENBIN_OCTA(GenBinEvOp, OctaName)                                      \
+  template <>                                                                  \
+  struct BinaryOp<Fortran::evaluate::GenBinEvOp<Fortran::evaluate::Type<       \
+      Fortran::common::TypeCategory::Real, 32>>> {                             \
+    using Op = Fortran::evaluate::GenBinEvOp<Fortran::evaluate::Type<          \
+        Fortran::common::TypeCategory::Real, 32>>;                             \
+    static hlfir::EntityWithAttributes gen(mlir::Location loc,                 \
+                                           fir::FirOpBuilder &builder,         \
+                                           const Op &, hlfir::Entity lhs,      \
+                                           hlfir::Entity rhs) {                \
+      return hlfir::EntityWithAttributes{                                      \
+          genOctaCall(loc, builder, OctaName, {lhs, rhs})};                    \
+    }                                                                          \
+  };
+
+GENBIN_OCTA(Add, "octa_add")
+GENBIN_OCTA(Subtract, "octa_sub")
+GENBIN_OCTA(Multiply, "octa_mul")
+GENBIN_OCTA(Divide, "octa_div")
+
 template <int KIND>
 struct BinaryOp<Fortran::evaluate::Divide<
     Fortran::evaluate::Type<Fortran::common::TypeCategory::Complex, KIND>>> {

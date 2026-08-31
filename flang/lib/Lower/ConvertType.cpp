@@ -48,6 +48,27 @@ static mlir::Type genRealType(mlir::MLIRContext *context, int kind) {
       return mlir::Float80Type::get(context);
     case 16:
       return mlir::Float128Type::get(context);
+    case 32:
+      // REAL(32) is IEEE binary256, which neither MLIR nor LLVM has a floating
+      // point type for: MLIR's builtin floats stop at Float128Type and LLVM's
+      // widest is FP128TyID, with no MVT::f256 behind it. Rather than add a
+      // float type to both - which would pull in SelectionDAG legalisation and
+      // a soft-float libcall set on every backend - the value is carried as an
+      // opaque 256 bit blob and every operation on it becomes a call into
+      // liboctamath.
+      //
+      // i256 is deliberate and not a placeholder. It is the widest thing the
+      // backend already handles: the aggregate is passed byval and returned
+      // sret under the ordinary x86-64 SysV rule for a 32 byte aggregate, and
+      // gcc and clang were measured to agree on that, so this needs no psABI
+      // class for a 256 bit scalar - which is the thing the psABI genuinely
+      // does not define. See audit/abi/run.sh in the liboctamath repository.
+      //
+      // The cost is that nothing downstream can tell this is a real. Anything
+      // that dispatches on floatness - arith, math, the runtime's output
+      // formatting - takes the integer path and is wrong. Those places are
+      // handled one at a time and each is a deliberate case, never a fallback.
+      return mlir::IntegerType::get(context, 256);
     }
   }
   llvm_unreachable("REAL type translation not implemented");

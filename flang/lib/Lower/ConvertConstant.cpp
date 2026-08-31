@@ -281,6 +281,23 @@ static mlir::Value genScalarLit(
         builder.createIntegerConstant(loc, intType, value.word().ToInt64());
     return fir::BitcastOp::create(builder, loc, logicalType, integer);
   } else if constexpr (TC == Fortran::common::TypeCategory::Real) {
+    if constexpr (KIND == 32) {
+      // REAL(32) is carried as an opaque i256 (see genRealType in
+      // ConvertType.cpp), so a constant is its bit pattern and no APFloat is
+      // involved. That is not a workaround but the shorter path: APFloat has
+      // no binary256 semantics, so the hexadecimal-float route every other
+      // kind takes would have nothing to parse into.
+      //
+      // The bits come from the front end's own Real<Integer<256>, 237>, which
+      // folded the expression at 237 bits. Note what the generic `else` branch
+      // below would otherwise do with this kind: convert to IEEEdouble. That
+      // is a silent loss of 184 bits yielding an entirely plausible number,
+      // which is the failure mode this whole exercise exists to avoid.
+      mlir::Type ty = Fortran::lower::convertReal(builder.getContext(), KIND);
+      llvm::APInt bits(256, value.RawBits().Hexadecimal(), 16);
+      return mlir::arith::ConstantOp::create(
+          builder, loc, ty, mlir::IntegerAttr::get(ty, bits));
+    } else {
     std::string str = value.DumpHexadecimal();
     if constexpr (KIND == 2) {
       auto floatVal = consAPFloat(llvm::APFloatBase::IEEEhalf(), str);
@@ -301,6 +318,7 @@ static mlir::Value genScalarLit(
       // convert everything else to double
       auto floatVal = consAPFloat(llvm::APFloatBase::IEEEdouble(), str);
       return genRealConstant<KIND>(builder, loc, floatVal);
+    }
     }
   } else if constexpr (TC == Fortran::common::TypeCategory::Complex) {
     mlir::Value real = genScalarLit<Fortran::common::TypeCategory::Real, KIND>(

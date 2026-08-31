@@ -1164,12 +1164,67 @@ mlir::Value genComplexMathOp(fir::FirOpBuilder &builder, mlir::Location loc,
   return result;
 }
 
+// Generate a call into liboctamath for a REAL(32) intrinsic.
+//
+// This is the octuple analogue of genLibF128Call and it cannot reuse it. The
+// F128 entry points take and return values; liboctamath takes and returns
+// binary256 by pointer and returns an IEEE status word instead:
+//
+//     int octa_sqrt(octa_t *r, const octa_t *a, octa_rnd_t rnd);
+//
+// so the arguments are spilled to allocas and the result is read back from
+// one. The libFuncType computed from the table is used only for its argument
+// count - its shape does not describe the call that is emitted - and that is
+// said here because a reader who assumed otherwise would be misled.
+static mlir::Value genLibOctaCall(fir::FirOpBuilder &builder,
+                                  mlir::Location loc,
+                                  const MathOperation &mathOp,
+                                  mlir::FunctionType libFuncType,
+                                  llvm::ArrayRef<mlir::Value> args) {
+  mlir::Type i256 = builder.getIntegerType(256);
+  mlir::Type ref = fir::ReferenceType::get(i256);
+  mlir::Type i32 = builder.getI32Type();
+
+  llvm::SmallVector<mlir::Type> argTys(args.size() + 1, ref);
+  argTys.push_back(i32);
+  mlir::FunctionType callTy = builder.getFunctionType(argTys, {i32});
+
+  mlir::func::FuncOp funcOp = builder.getNamedFunction(mathOp.runtimeFunc);
+  if (!funcOp) {
+    funcOp = builder.createFunction(loc, mathOp.runtimeFunc, callTy);
+    funcOp->setAttr(
+        fir::getSymbolAttrName(),
+        mlir::StringAttr::get(builder.getContext(), mathOp.runtimeFunc));
+    funcOp->setAttr(fir::FIROpsDialect::getFirRuntimeAttrName(),
+                    builder.getUnitAttr());
+  }
+
+  mlir::Value result = fir::AllocaOp::create(builder, loc, i256);
+  llvm::SmallVector<mlir::Value> operands;
+  operands.push_back(result);
+  for (mlir::Value a : args) {
+    mlir::Value slot = fir::AllocaOp::create(builder, loc, i256);
+    fir::StoreOp::create(builder, loc, a, slot);
+    operands.push_back(slot);
+  }
+  // OCTA_RND_NEAREST_EVEN.
+  operands.push_back(builder.createIntegerConstant(loc, i32, 0));
+
+  // The status word is dropped; nothing carries IEEE flags for this kind yet.
+  (void)libFuncType;
+  fir::CallOp::create(builder, loc, funcOp, operands);
+  return fir::LoadOp::create(builder, loc, result);
+}
+
 /// Mapping between mathematical intrinsic operations and MLIR operations
 /// of some appropriate dialect (math, complex, etc.) or libm calls.
 /// TODO: support remaining Fortran math intrinsics.
 ///       See https://gcc.gnu.org/onlinedocs/gcc-12.1.0/gfortran/\
 ///       Intrinsic-Procedures.html for a reference.
 constexpr auto FuncTypeReal16Real16 = genFuncType<Ty::Real<16>, Ty::Real<16>>;
+constexpr auto FuncTypeReal32Real32 = genFuncType<Ty::Real<32>, Ty::Real<32>>;
+constexpr auto FuncTypeReal32Real32Real32 =
+    genFuncType<Ty::Real<32>, Ty::Real<32>, Ty::Real<32>>;
 constexpr auto FuncTypeReal16Real16Real16 =
     genFuncType<Ty::Real<16>, Ty::Real<16>, Ty::Real<16>>;
 constexpr auto FuncTypeReal16Real16Real16Real16 =
@@ -1274,12 +1329,15 @@ static constexpr MathOperation mathOperations[] = {
      genMathOp<mlir::math::Atan2Op>},
     {"atan", RTNAME_STRING(Atan2F128), FuncTypeReal16Real16Real16,
      genLibF128Call},
+    {"atan", "octa_atan", FuncTypeReal32Real32, genLibOctaCall},
     {"atan2", "atan2f", genFuncType<Ty::Real<4>, Ty::Real<4>, Ty::Real<4>>,
      genMathOp<mlir::math::Atan2Op>},
     {"atan2", "atan2", genFuncType<Ty::Real<8>, Ty::Real<8>, Ty::Real<8>>,
      genMathOp<mlir::math::Atan2Op>},
     {"atan2", RTNAME_STRING(Atan2F128), FuncTypeReal16Real16Real16,
      genLibF128Call},
+    {"atan2", "octa_atan2", FuncTypeReal32Real32Real32,
+     genLibOctaCall},
     {"atanh", "atanhf", genFuncType<Ty::Real<4>, Ty::Real<4>>,
      genMathOp<mlir::math::AtanhOp>},
     {"atanh", "atanh", genFuncType<Ty::Real<8>, Ty::Real<8>>,
@@ -1332,6 +1390,7 @@ static constexpr MathOperation mathOperations[] = {
      genComplexMathOp<mlir::complex::CosOp>},
     {"cos", RTNAME_STRING(CCosF128), FuncTypeComplex16Complex16,
      genLibF128Call},
+    {"cos", "octa_cos", FuncTypeReal32Real32, genLibOctaCall},
     {"cosh", "coshf", genFuncType<Ty::Real<4>, Ty::Real<4>>,
      genMathOp<mlir::math::CoshOp>},
     {"cosh", "cosh", genFuncType<Ty::Real<8>, Ty::Real<8>>,
@@ -1366,11 +1425,13 @@ static constexpr MathOperation mathOperations[] = {
     {"erf", "erf", genFuncType<Ty::Real<8>, Ty::Real<8>>,
      genMathOp<mlir::math::ErfOp>},
     {"erf", RTNAME_STRING(ErfF128), FuncTypeReal16Real16, genLibF128Call},
+    {"erf", "octa_erf", FuncTypeReal32Real32, genLibOctaCall},
     {"erfc", "erfcf", genFuncType<Ty::Real<4>, Ty::Real<4>>,
      genMathOp<mlir::math::ErfcOp>},
     {"erfc", "erfc", genFuncType<Ty::Real<8>, Ty::Real<8>>,
      genMathOp<mlir::math::ErfcOp>},
     {"erfc", RTNAME_STRING(ErfcF128), FuncTypeReal16Real16, genLibF128Call},
+    {"erfc", "octa_erfc", FuncTypeReal32Real32, genLibOctaCall},
     {"exp", "expf", genFuncType<Ty::Real<4>, Ty::Real<4>>,
      genMathOp<mlir::math::ExpOp>},
     {"exp", "exp", genFuncType<Ty::Real<8>, Ty::Real<8>>,
@@ -1382,6 +1443,7 @@ static constexpr MathOperation mathOperations[] = {
      genComplexMathOp<mlir::complex::ExpOp>},
     {"exp", RTNAME_STRING(CExpF128), FuncTypeComplex16Complex16,
      genLibF128Call},
+    {"exp", "octa_exp", FuncTypeReal32Real32, genLibOctaCall},
     {"feclearexcept", "feclearexcept",
      genFuncType<Ty::Integer<4>, Ty::Integer<4>>, genLibCall},
     {"fedisableexcept", "fedisableexcept",
@@ -1420,12 +1482,15 @@ static constexpr MathOperation mathOperations[] = {
     {"gamma", "tgammaf", genFuncType<Ty::Real<4>, Ty::Real<4>>, genLibCall},
     {"gamma", "tgamma", genFuncType<Ty::Real<8>, Ty::Real<8>>, genLibCall},
     {"gamma", RTNAME_STRING(TgammaF128), FuncTypeReal16Real16, genLibF128Call},
+    {"gamma", "octa_gamma", FuncTypeReal32Real32, genLibOctaCall},
     {"hypot", "hypotf", genFuncType<Ty::Real<4>, Ty::Real<4>, Ty::Real<4>>,
      genLibCall},
     {"hypot", "hypot", genFuncType<Ty::Real<8>, Ty::Real<8>, Ty::Real<8>>,
      genLibCall},
     {"hypot", RTNAME_STRING(HypotF128), FuncTypeReal16Real16Real16,
      genLibF128Call},
+    {"hypot", "octa_hypot", FuncTypeReal32Real32Real32,
+     genLibOctaCall},
     {"log", "logf", genFuncType<Ty::Real<4>, Ty::Real<4>>,
      genMathOp<mlir::math::LogOp>},
     {"log", "log", genFuncType<Ty::Real<8>, Ty::Real<8>>,
@@ -1437,6 +1502,7 @@ static constexpr MathOperation mathOperations[] = {
      genComplexMathOp<mlir::complex::LogOp>},
     {"log", RTNAME_STRING(CLogF128), FuncTypeComplex16Complex16,
      genLibF128Call},
+    {"log", "octa_log", FuncTypeReal32Real32, genLibOctaCall},
     {"log10", "log10f", genFuncType<Ty::Real<4>, Ty::Real<4>>,
      genMathOp<mlir::math::Log10Op>},
     {"log10", "log10", genFuncType<Ty::Real<8>, Ty::Real<8>>,
@@ -1564,6 +1630,7 @@ static constexpr MathOperation mathOperations[] = {
      genComplexMathOp<mlir::complex::SinOp>},
     {"sin", RTNAME_STRING(CSinF128), FuncTypeComplex16Complex16,
      genLibF128Call},
+    {"sin", "octa_sin", FuncTypeReal32Real32, genLibOctaCall},
     {"sinh", "sinhf", genFuncType<Ty::Real<4>, Ty::Real<4>>,
      genMathOp<mlir::math::SinhOp>},
     {"sinh", "sinh", genFuncType<Ty::Real<8>, Ty::Real<8>>,
@@ -1578,6 +1645,11 @@ static constexpr MathOperation mathOperations[] = {
     {"sqrt", "sqrt", genFuncType<Ty::Real<8>, Ty::Real<8>>,
      genMathOp<mlir::math::SqrtOp>},
     {"sqrt", RTNAME_STRING(SqrtF128), FuncTypeReal16Real16, genLibF128Call},
+    // REAL(32) goes to liboctamath; no libm has these at 237 bits, which is
+    // why that library exists. The rows sit in the table's alphabetical order
+    // because mathOps.Verify() is a static_assert on it - grouping them
+    // together, which reads better, does not compile.
+    {"sqrt", "octa_sqrt", FuncTypeReal32Real32, genLibOctaCall},
     {"sqrt", "csqrtf", genFuncType<Ty::Complex<4>, Ty::Complex<4>>,
      genComplexMathOp<mlir::complex::SqrtOp>},
     {"sqrt", "csqrt", genFuncType<Ty::Complex<8>, Ty::Complex<8>>,
@@ -1595,6 +1667,7 @@ static constexpr MathOperation mathOperations[] = {
      genComplexMathOp<mlir::complex::TanOp>},
     {"tan", RTNAME_STRING(CTanF128), FuncTypeComplex16Complex16,
      genLibF128Call},
+    {"tan", "octa_tan", FuncTypeReal32Real32, genLibOctaCall},
     {"tanh", "tanhf", genFuncType<Ty::Real<4>, Ty::Real<4>>,
      genMathOp<mlir::math::TanhOp>},
     {"tanh", "tanh", genFuncType<Ty::Real<8>, Ty::Real<8>>,
