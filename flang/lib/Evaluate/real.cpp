@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "flang/Evaluate/real.h"
+#include <memory>
 #include "flang/Common/idioms.h"
 #include "flang/Decimal/decimal.h"
 #include "llvm/Support/raw_ostream.h"
@@ -740,14 +741,22 @@ llvm::raw_ostream &Real<W, P>::AsFortran(
   } else {
     using B = decimal::BinaryFloatingPointNumber<P>;
     B value{word_.template ToUInt<typename B::RawType>()};
-    char buffer[common::MaxDecimalConversionDigits(P) +
-        EXTRA_DECIMAL_CONVERSION_SPACE];
+    // Heap, not stack. The size follows the format: about 11.5 KiB at
+    // binary128 and 179 KiB at binary256, which is more than a single frame
+    // should spend and, at the wider end, more than some stacks have. This is
+    // compiler-side only - flang/lib/Evaluate is not part of the device
+    // runtime - so an ordinary allocation is available here, unlike in
+    // flang/lib/Decimal, which is compiled for the GPU as well.
+    constexpr std::size_t bufferSize{
+        common::MaxDecimalConversionDigits(P) + EXTRA_DECIMAL_CONVERSION_SPACE};
+    auto bufferOwner{std::make_unique<char[]>(bufferSize)};
+    char *buffer{bufferOwner.get()};
     decimal::DecimalConversionFlags flags{}; // default: exact representation
     if (minimal) {
       flags = decimal::Minimize;
     }
-    auto result{decimal::ConvertToDecimal<P>(buffer, sizeof buffer, flags,
-        static_cast<int>(sizeof buffer), decimal::RoundNearest, value)};
+    auto result{decimal::ConvertToDecimal<P>(buffer, bufferSize, flags,
+        static_cast<int>(bufferSize), decimal::RoundNearest, value)};
     const char *p{result.str};
     if (DEREF(p) == '-' || *p == '+') {
       o << *p++;

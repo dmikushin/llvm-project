@@ -39,6 +39,54 @@ static constexpr std::uint64_t TenToThe(int power) {
   return power <= 0 ? 1 : 10 * TenToThe(power - 1);
 }
 
+// Storage for the digit array.
+//
+// The array is sized to hold the exact decimal expansion of the smallest
+// subnormal, so it grows with the format: 71 elements at binary64, 1034 at
+// binary128 - about 8 KiB - and 16401 at binary256, about 128 KiB. Three of
+// these objects are live simultaneously in the Minimize path of
+// ConvertToDecimal, which builds the two adjacent binary values in order to
+// find the shortest decimal that maps back. Measured with -fstack-usage on
+// this file as it stands, ConvertToDecimal<113> occupies 24968 bytes of
+// stack; the same structure at binary256 would be about 384 KiB.
+//
+// Below a threshold the storage stays exactly what it was, an ordinary member
+// array. That keeps every currently supported kind byte-for-byte unchanged and
+// - the reason it matters - keeps the device build allocation-free: this file
+// is compiled into flang-rt for the GPU, and the explicit instantiations in
+// flang/Decimal/decimal.h stop at binary128, so no device instantiation ever
+// crosses the threshold.
+//
+// Above it the storage moves to the heap. That path exists for binary256,
+// which is only ever instantiated in the compiler and in the host runtime,
+// where operator new is available and where 384 KiB of stack in one frame is
+// not something to spend.
+template <typename D, int N, bool Heap = (sizeof(D) * N > 64 * 1024)>
+class DigitStorage {
+public:
+  RT_API_ATTRS D &operator[](int j) { return d_[j]; }
+  RT_API_ATTRS const D &operator[](int j) const { return d_[j]; }
+
+private:
+  D d_[N];
+};
+
+template <typename D, int N> class DigitStorage<D, N, true> {
+public:
+  DigitStorage() : d_{new D[N]} {}
+  ~DigitStorage() { delete[] d_; }
+  // Never copied: the enclosing class's copy constructor copies the live
+  // digits one by one into freshly constructed storage. Deleting these makes
+  // that a compile error rather than a double free if anyone changes it.
+  DigitStorage(const DigitStorage &) = delete;
+  DigitStorage &operator=(const DigitStorage &) = delete;
+  D &operator[](int j) { return d_[j]; }
+  const D &operator[](int j) const { return d_[j]; }
+
+private:
+  D *d_;
+};
+
 // 10**(LOG10RADIX + 3) must be < 2**wordbits, and LOG10RADIX must be
 // even, so that pairs of decimal digits do not straddle Digits.
 // So LOG10RADIX must be 16 or 6.
@@ -384,7 +432,10 @@ private:
     return result - 1; // decrement exponent, set all significand bits
   }
 
-  Digit digit_[maxDigits]; // in little-endian order: digit_[0] is LSD
+  // See DigitStorage above: an ordinary array below 64 KiB, which is
+  // every kind that exists today and every one the device build
+  // instantiates, and heap-backed above it.
+  DigitStorage<Digit, maxDigits> digit_; // little-endian: digit_[0] is LSD
   int digits_{0}; // # of elements in digit_[] array; zero when zero
   int digitLimit_{maxDigits}; // precision clamp
   int exponent_{0}; // signed power of ten
