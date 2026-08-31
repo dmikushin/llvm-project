@@ -1210,9 +1210,13 @@ static mlir::Value genLibOctaCall(fir::FirOpBuilder &builder,
   // OCTA_RND_NEAREST_EVEN.
   operands.push_back(builder.createIntegerConstant(loc, i32, 0));
 
-  // The status word is dropped; nothing carries IEEE flags for this kind yet.
+  // The status word goes to the hardware flags, so IEEE_GET_FLAG sees the
+  // exceptions an intrinsic raised. See genRaiseOctaStatus for what does not
+  // survive the translation: OCTA_ZIV_EXHAUSTED has no IEEE flag to land on.
   (void)libFuncType;
-  fir::CallOp::create(builder, loc, funcOp, operands);
+  mlir::Value status =
+      fir::CallOp::create(builder, loc, funcOp, operands).getResult(0);
+  fir::runtime::genRaiseOctaStatus(builder, loc, status);
   return fir::LoadOp::create(builder, loc, result);
 }
 

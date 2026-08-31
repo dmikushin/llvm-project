@@ -76,6 +76,7 @@
 // CHECK-NEXT: func.func private @_FortranAioOutputInteger8(!fir.ref<i8>, i8) -> i1 attributes {fir.io, fir.runtime}
 // CHECK-NEXT: func.func private @_FortranAioOutputLogical(!fir.ref<i8>, i1) -> i1 attributes {fir.io, fir.runtime}
 // CHECK-NEXT: func.func private @_FortranAioOutputNamelist(!fir.ref<i8>, !fir.ref<tuple<>>) -> i1 attributes {fir.io, fir.runtime}
+// CHECK-NEXT: func.func private @_FortranAioOutputPreformattedReal(!fir.ref<i8>, !fir.ref<i8>, i64) -> i1 attributes {fir.io, fir.runtime}
 // CHECK-NEXT: func.func private @_FortranAioOutputReal32(!fir.ref<i8>, f32) -> i1 attributes {fir.io, fir.runtime}
 // CHECK-NEXT: func.func private @_FortranAioOutputReal64(!fir.ref<i8>, f64) -> i1 attributes {fir.io, fir.runtime}
 // CHECK-NEXT: func.func private @_FortranAioSetAccess(!fir.ref<i8>, !fir.ref<i8>, i64) -> i1 attributes {fir.io, fir.runtime}

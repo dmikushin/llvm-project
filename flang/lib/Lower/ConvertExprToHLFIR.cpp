@@ -28,6 +28,7 @@
 #include "flang/Optimizer/Builder/IntrinsicCall.h"
 #include "flang/Optimizer/Builder/MutableBox.h"
 #include "flang/Optimizer/Builder/Runtime/Derived.h"
+#include "flang/Optimizer/Builder/Runtime/Exceptions.h"
 #include "flang/Optimizer/Builder/Runtime/Pointer.h"
 #include "flang/Optimizer/Builder/Todo.h"
 #include "flang/Optimizer/Dialect/FIRAttr.h"
@@ -1228,10 +1229,16 @@ static mlir::Value genOctaCall(mlir::Location loc, fir::FirOpBuilder &builder,
   // ordinary expression, and IEEE_SET_ROUNDING_MODE is not wired up here.
   operands.push_back(builder.createIntegerConstant(loc, i32, 0));
 
-  // The status word is discarded. That is a real gap, not an oversight: the
-  // library reports IEEE flags plus OCTA_ZIV_EXHAUSTED per call, and nothing
-  // yet carries them to IEEE_GET_FLAGS. Recorded rather than hidden.
-  fir::CallOp::create(builder, loc, fn, operands);
+  // The library reports IEEE flags per call rather than accumulating them, so
+  // they are raised into the hardware status word here - that is where
+  // IEEE_GET_FLAG looks, through fetestexcept, and following it is what makes
+  // the IEEE_ARITHMETIC module observe this kind at all. Raising them inside
+  // the library instead would undo a deliberate decision of its interface,
+  // which returns flags per call precisely so that a caller is never handed
+  // someone else's history.
+  mlir::Value status =
+      fir::CallOp::create(builder, loc, fn, operands).getResult(0);
+  fir::runtime::genRaiseOctaStatus(builder, loc, status);
   return fir::LoadOp::create(builder, loc, result);
 }
 

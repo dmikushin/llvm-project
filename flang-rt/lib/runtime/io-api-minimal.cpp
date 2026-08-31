@@ -131,6 +131,35 @@ bool IODEF(OutputAscii)(Cookie cookie, const char *x, std::size_t length) {
   }
 }
 
+// Emit characters the compiler already formatted, as one list-directed field.
+//
+// The difference from OutputAscii is that the whole length is offered to
+// EmitLeadingSpaceOrAdvance, so a field that does not fit in what remains of
+// the record starts a new one instead of being cut in half. Undelimited
+// character output deliberately does the opposite - a string may be continued
+// - and applying that to a number severs its exponent.
+//
+// Only list-directed output is handled here. Under an explicit edit descriptor
+// the field width is the format's business, not ours, and silently emitting a
+// preformatted string of some other width would be worse than refusing.
+bool IODEF(OutputPreformattedReal)(
+    Cookie cookie, const char *x, std::size_t length) {
+  IoStatementState &io{*cookie};
+  if (!x) {
+    io.GetIoErrorHandler().Crash(
+        "Null address for preformatted real output item");
+  } else if (auto *listOutput{
+                 io.get_if<ListDirectedStatementState<Direction::Output>>()}) {
+    return ListDirectedPreformattedOutput(io, *listOutput, x, length);
+  } else if (io.CheckFormattedStmtType<Direction::Output>(
+                 "OutputPreformattedReal")) {
+    auto edit{io.GetNextDataEdit()};
+    return edit && EditCharacterOutput(io, *edit, x, length);
+  } else {
+    return false;
+  }
+}
+
 bool IODEF(OutputLogical)(Cookie cookie, bool truth) {
   IoStatementState &io{*cookie};
   if (auto *listOutput{

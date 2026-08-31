@@ -98,6 +98,16 @@ RT_API_ATTRS bool ListDirectedLogicalOutput(
     IoStatementState &, ListDirectedStatementState<Direction::Output> &, bool);
 RT_API_ATTRS bool EditLogicalOutput(IoStatementState &, const DataEdit &, bool);
 
+/// Emit already-formatted characters as one indivisible list-directed field.
+///
+/// Shaped like ListDirectedLogicalOutput rather than like the character one,
+/// and for the same reason: the whole width is offered up front, so an item
+/// that does not fit in what remains of the record starts a new record instead
+/// of continuing across the boundary.
+RT_API_ATTRS bool ListDirectedPreformattedOutput(IoStatementState &,
+    ListDirectedStatementState<Direction::Output> &, const char *,
+    std::size_t chars);
+
 template <typename CHAR>
 RT_API_ATTRS bool ListDirectedCharacterOutput(IoStatementState &,
     ListDirectedStatementState<Direction::Output> &, const CHAR *,

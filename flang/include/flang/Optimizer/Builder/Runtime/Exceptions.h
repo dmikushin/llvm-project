@@ -54,5 +54,16 @@ mlir::Value genGetModesTypeSize(fir::FirOpBuilder &builder, mlir::Location loc);
 mlir::Value genGetStatusTypeSize(fir::FirOpBuilder &builder,
                                  mlir::Location loc);
 
+/// Raise the IEEE exceptions named by a liboctamath status word.
+///
+/// REAL(32) arithmetic happens in a software library, so its exceptions never
+/// reach the hardware status word that IEEE_GET_FLAG reads through
+/// fetestexcept. This translates the library's own bit set into flang's
+/// ieee_flag_type encoding and raises it, which is what makes the
+/// IEEE_ARITHMETIC module observe binary256 arithmetic at all rather than
+/// report a permanently clear set.
+void genRaiseOctaStatus(fir::FirOpBuilder &builder, mlir::Location loc,
+                        mlir::Value status);
+
 } // namespace fir::runtime
 #endif // FORTRAN_OPTIMIZER_BUILDER_RUNTIME_EXCEPTIONS_H

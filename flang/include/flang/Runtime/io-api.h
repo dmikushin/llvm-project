@@ -274,6 +274,25 @@ bool IODECL(OutputComplex64)(Cookie, double, double);
 bool IODECL(InputComplex64)(Cookie, double[2]);
 bool IODECL(OutputCharacter)(Cookie, const char *, std::size_t, int kind = 1);
 bool IODECL(OutputAscii)(Cookie, const char *, std::size_t);
+
+// Output a numeric field that the compiler has already converted to
+// characters, as a single item that is not split across records.
+//
+// This exists for REAL(32), whose decimal conversion the runtime cannot
+// perform: it is carried as an opaque 256-bit blob and flang/lib/Decimal is
+// not instantiated at precision 237 inside flang-rt, because the buffers that
+// width needs would have to come from a heap the freestanding runtime does not
+// have. The characters are produced at the call site instead.
+//
+// It is not OutputAscii, and the difference is the whole reason it exists.
+// Undelimited list-directed character output fills the current record and
+// continues on the next, which is right for a string and wrong for a number:
+// a binary256 value near the ends of its 19-bit exponent range needs about 80
+// characters, so it lands exactly on the record boundary and comes out with
+// its exponent severed. Here the item is emitted as one field, advancing to a
+// new record first if it would not fit.
+bool IODECL(OutputPreformattedReal)(Cookie, const char *, std::size_t);
+
 bool IODECL(InputCharacter)(Cookie, char *, std::size_t, int kind = 1);
 bool IODECL(InputAscii)(Cookie, char *, std::size_t);
 bool IODECL(OutputLogical)(Cookie, bool);

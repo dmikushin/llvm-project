@@ -701,6 +701,112 @@ static mlir::func::FuncOp getOutputFunc(mlir::Location loc,
                                                                    builder);
 }
 
+/// Is this output item a scalar REAL(32)?
+///
+/// The question has to be asked of the Fortran type, not of the lowered one.
+/// REAL(32) is carried as an opaque i256, and by the time getOutputFunc sees
+/// the type there is nothing left to distinguish binary256 from a 256-bit
+/// integer - which is why it reached llvm_unreachable("unknown OutputInteger
+/// kind") rather than any diagnostic about reals.
+static bool isScalarReal32(const Fortran::lower::SomeExpr *expr) {
+  if (expr->Rank() != 0)
+    return false;
+  std::optional<Fortran::evaluate::DynamicType> dt = expr->GetType();
+  return dt && dt->category() == Fortran::common::TypeCategory::Real &&
+         dt->kind() == 32;
+}
+
+/// Emit list-directed output of a scalar REAL(32) through liboctamath.
+///
+/// The runtime cannot format this type and is not asked to. flang-rt has no
+/// decimal conversion at 237 bits - the PREC=237 instantiations of
+/// flang/lib/Decimal are excluded from it because their heap path needs
+/// operator new[], which the freestanding runtime does not have - so the value
+/// is formatted here, by the same library that already performs every
+/// arithmetic operation and every intrinsic on this kind, and the resulting
+/// characters are handed to the ordinary OutputAscii path.
+///
+/// The alternative was to give flang-rt an OutputReal256 entry point and a
+/// dependency on liboctamath, which is the shape the quad route has with
+/// libquadmath. It was not taken because it would make every Fortran program
+/// link liboctamath, including the overwhelming majority that never mention
+/// REAL(32); formatting at the call site keeps the dependency exactly where
+/// the blob lowering already puts it, on programs that use the kind.
+///
+/// The characters go to OutputPreformattedReal rather than OutputAscii. That
+/// is not cosmetic: undelimited list-directed character output continues a
+/// string onto the next record when the current one fills, and a binary256
+/// value near the ends of its exponent range is about eighty characters wide,
+/// so it lands on the boundary and comes out with its exponent severed. The
+/// first version of this did exactly that and printed 1.61...e789 followed by
+/// 13 on the next line.
+///
+/// What this does not cover, stated because the omission is invisible from
+/// here: arrays and anything that goes through a descriptor. Those reach
+/// OutputDescriptor with a type code the runtime has no case for.
+static void genOutputReal32(Fortran::lower::AbstractConverter &converter,
+                            mlir::Location loc, mlir::Value cookie,
+                            const Fortran::lower::SomeExpr *expr,
+                            Fortran::lower::StatementContext &stmtCtx,
+                            mlir::Value &ok) {
+  fir::FirOpBuilder &builder = converter.getFirOpBuilder();
+  mlir::Type i256 = builder.getIntegerType(256);
+  mlir::Type i8 = builder.getIntegerType(8);
+  mlir::Type i32 = builder.getI32Type();
+  mlir::Type i64 = builder.getI64Type();
+
+  // The shortest decimal that reads back as the same binary256 value needs at
+  // most 73 significant digits, plus sign, point and exponent. 128 is chosen
+  // to leave that no way of being tight; octa_format reports a buffer it
+  // cannot fit rather than truncating, and the failure is checked below.
+  constexpr std::int64_t bufLen = 128;
+  mlir::Type bufTy = fir::SequenceType::get({bufLen}, i8);
+  mlir::Value buf = fir::AllocaOp::create(builder, loc, bufTy);
+  mlir::Value bufPtr = builder.createConvert(
+      loc, fir::ReferenceType::get(i8), buf);
+
+  mlir::Value value = fir::getBase(converter.genExprValue(loc, expr, stmtCtx));
+  mlir::Value slot = fir::AllocaOp::create(builder, loc, i256);
+  fir::StoreOp::create(builder, loc, value, slot);
+
+  mlir::FunctionType fmtTy = builder.getFunctionType(
+      {fir::ReferenceType::get(i8), i64, fir::ReferenceType::get(i256)}, {i32});
+  mlir::func::FuncOp fmtFunc = builder.getNamedFunction("octa_format");
+  if (!fmtFunc) {
+    fmtFunc = builder.createFunction(loc, "octa_format", fmtTy);
+    fmtFunc->setAttr(fir::FIROpsDialect::getFirRuntimeAttrName(),
+                     builder.getUnitAttr());
+  }
+  mlir::Value cap = builder.createIntegerConstant(loc, i64, bufLen);
+  mlir::Value len =
+      fir::CallOp::create(builder, loc, fmtFunc,
+                          mlir::ValueRange{bufPtr, cap, slot})
+          .getResult(0);
+
+  // A negative length means the value could not be formatted. Clamping it to
+  // zero would print an empty field and look like a value that happens to be
+  // blank; the runtime's own error path is not reachable from here, so the
+  // honest minimum is to emit nothing rather than something wrong. The
+  // comparison is kept so that a future caller can see where to hang a
+  // diagnostic.
+  mlir::Value zero = builder.createIntegerConstant(loc, i32, 0);
+  mlir::Value ok32 = mlir::arith::CmpIOp::create(
+      builder, loc, mlir::arith::CmpIPredicate::sgt, len, zero);
+  mlir::Value safeLen = mlir::arith::SelectOp::create(builder, loc, ok32, len,
+                                                      zero);
+  mlir::Value lenArg = builder.createConvert(loc, i64, safeLen);
+
+  mlir::func::FuncOp outputFunc =
+      fir::runtime::getIORuntimeFunc<mkIOKey(OutputPreformattedReal)>(loc,
+                                                                     builder);
+  mlir::Type ptrArg = outputFunc.getFunctionType().getInput(1);
+  mlir::Type lenTy = outputFunc.getFunctionType().getInput(2);
+  llvm::SmallVector<mlir::Value> args = {
+      cookie, builder.createConvert(loc, ptrArg, bufPtr),
+      builder.createConvert(loc, lenTy, lenArg)};
+  ok = fir::CallOp::create(builder, loc, outputFunc, args).getResult(0);
+}
+
 /// Generate a sequence of output data transfer calls.
 static void genOutputItemList(
     Fortran::lower::AbstractConverter &converter, mlir::Value cookie,
@@ -721,6 +827,10 @@ static void genOutputItemList(
     const auto *expr = Fortran::semantics::GetExpr(pExpr);
     if (!expr)
       fir::emitFatalError(loc, "internal error: could not get evaluate::Expr");
+    if (isFormatted && isScalarReal32(expr)) {
+      genOutputReal32(converter, loc, cookie, expr, stmtCtx, ok);
+      continue;
+    }
     mlir::Type itemTy = converter.genType(*expr);
     mlir::func::FuncOp outputFunc =
         getOutputFunc(loc, builder, itemTy, isFormatted);

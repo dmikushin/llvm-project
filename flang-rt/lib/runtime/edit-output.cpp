@@ -828,6 +828,27 @@ RT_API_ATTRS bool ListDirectedLogicalOutput(IoStatementState &io,
       EmitAscii(io, truth ? "T" : "F", 1);
 }
 
+RT_API_ATTRS bool ListDirectedPreformattedOutput(IoStatementState &io,
+    ListDirectedStatementState<Direction::Output> &list, const char *x,
+    std::size_t length) {
+  // The separating blank counts as part of the field, which is what makes an
+  // item that has been pushed onto a new record still begin with one - every
+  // line of ordinary list-directed real output starts with a blank, including
+  // the continuation lines. EmitLeadingSpaceOrAdvance emits the blank only
+  // when it does not advance, so using it here loses the blank on exactly the
+  // values long enough to wrap, which for binary256 is most of them.
+  //
+  // The whole width is offered before deciding, so the field is never split;
+  // ListDirectedCharacterOutput deliberately does the opposite, and applying
+  // that to a number severs its exponent.
+  const ConnectionState &connection{io.GetConnectionState()};
+  if (connection.NeedAdvance(length + 1) && !io.AdvanceRecord()) {
+    return false;
+  }
+  list.set_lastWasUndelimitedCharacter(false);
+  return EmitAscii(io, " ", 1) && EmitAscii(io, x, length);
+}
+
 RT_API_ATTRS bool EditLogicalOutput(
     IoStatementState &io, const DataEdit &edit, bool truth) {
   switch (edit.descriptor) {
