@@ -34,6 +34,8 @@ static constexpr int BitsForBinaryPrecision(int binaryPrecision) {
     return 128;
   case 113: // IEEE quad precision: 1+15+112 with implicit bit
     return 128;
+  case 237: // IEEE octuple precision: 1+19+236 with implicit bit
+    return 256;
   default:
     return -1;
   }
@@ -58,6 +60,11 @@ static constexpr int MaxDecimalConversionDigits(int binaryPrecision) {
     return 2 * 767;
   case 113: // IEEE quad precision: 1+15+112 with implicit bit
     return 11563;
+  case 237: // IEEE octuple precision: 1+19+236 with implicit bit
+    // Derived by the rule stated above rather than estimated: the same
+    // computation reproduces 112, 767 and 11563 for binary32, binary64 and
+    // binary128, which is what says the rule was read correctly.
+    return 183466;
   default:
     return -1;
   }
@@ -82,6 +89,8 @@ static constexpr int RealKindForPrecision(int binaryPrecision) {
   // TODO: case 106: return kind for double/double
   case 113: // IEEE quad precision: 1+15+112 with implicit bit
     return 16;
+  case 237: // IEEE octuple precision: 1+19+236 with implicit bit
+    return 32;
   default:
     return -1;
   }
@@ -102,6 +111,8 @@ static constexpr int PrecisionOfRealKind(int kind) {
   // TODO: case kind for double/double: return 106;
   case 16: // IEEE quad precision: 1+15+112 with implicit bit
     return 113;
+  case 32: // IEEE octuple precision: 1+19+236 with implicit bit
+    return 237;
   default:
     return -1;
   }

@@ -16,13 +16,13 @@
 // Canonical lists of supported Fortran kinds for each intrinsic type.
 #define FORTRAN_INTEGER_KINDS {1, 2, 4, 8, 16}
 #define FORTRAN_UNSIGNED_KINDS FORTRAN_INTEGER_KINDS
-#define FORTRAN_REAL_KINDS {2, 3, 4, 8, 10, 16}
+#define FORTRAN_REAL_KINDS {2, 3, 4, 8, 10, 16, 32}
 #define FORTRAN_LOGICAL_KINDS {1, 2, 4, 8}
 #define FORTRAN_CHARACTER_KINDS {1, 2, 4}
 
 namespace Fortran::common {
 
-static constexpr int maxKind{16};
+static constexpr int maxKind{32};
 
 template <typename T, std::size_t N>
 static constexpr bool IsKindInList(const T (&kinds)[N], std::int64_t kind) {
