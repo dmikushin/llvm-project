@@ -1262,6 +1262,127 @@ GENBIN_OCTA(Subtract, "octa_sub")
 GENBIN_OCTA(Multiply, "octa_mul")
 GENBIN_OCTA(Divide, "octa_div")
 
+/// Convert to or from REAL(32).
+///
+/// fir.convert dispatches on the MLIR type, and REAL(32) is carried as i256,
+/// so every conversion involving it was being lowered as an *integer*
+/// conversion. Measured before this was written, all three directions were
+/// wrong and wrong in different ways:
+///
+///     INTEGER(4) -> REAL(32)   sext i32 to i256
+///     REAL(8)    -> REAL(32)   call llvm.fptosi.sat.i256.f64
+///     REAL(32)   -> REAL(8)    sitofp i256 to double
+///
+/// The first two both produce the integer 20 from the value 20, which is then
+/// read as a binary256 bit pattern - the identical subnormal 4.496e-78983 in
+/// both cases, which is what made them look like one defect rather than two.
+/// The third reads 256 bits of significand and exponent as one huge integer.
+///
+/// Nothing here crashed and nothing warned, which is the reason this survived
+/// scalar testing: every check that compared against MPFR built its values
+/// from literals, and the literal path never goes through fir.convert.
+///
+/// The direction is decided by the MLIR types rather than by the Fortran
+/// categories, because the source kind is not a template parameter here - only
+/// its category is. That is sound only while i256 unambiguously means REAL(32),
+/// which holds because Fortran's widest integer kind is 16. The same
+/// assumption is recorded at getTypeCode and mlirTypeToCategoryKind; an
+/// INTEGER(32) would invalidate all three at once.
+static mlir::Value genOctaConvert(mlir::Location loc,
+                                  fir::FirOpBuilder &builder, mlir::Type toTy,
+                                  mlir::Value val) {
+  mlir::Type i256 = builder.getIntegerType(256);
+  mlir::Type refI256 = fir::ReferenceType::get(i256);
+  mlir::Type i32 = builder.getI32Type();
+  mlir::Type fromTy = val.getType();
+
+  auto callConv = [&](llvm::StringRef name, mlir::Type resTy,
+                      mlir::Type argTy, bool resultByRef, bool hasRnd,
+                      bool returnsStatus) -> mlir::Value {
+    llvm::SmallVector<mlir::Type> argTys;
+    llvm::SmallVector<mlir::Type> resTys;
+    mlir::Value slot;
+    if (resultByRef) {
+      slot = fir::AllocaOp::create(builder, loc, resTy);
+      argTys.push_back(fir::ReferenceType::get(resTy));
+    }
+    argTys.push_back(argTy);
+    if (hasRnd)
+      argTys.push_back(i32);
+    if (returnsStatus)
+      resTys.push_back(i32);
+    else if (!resultByRef)
+      resTys.push_back(resTy);
+
+    mlir::func::FuncOp fn = builder.createFunction(
+        loc, name, builder.getFunctionType(argTys, resTys));
+
+    llvm::SmallVector<mlir::Value> operands;
+    if (resultByRef)
+      operands.push_back(slot);
+    operands.push_back(val);
+    if (hasRnd)
+      operands.push_back(builder.createIntegerConstant(loc, i32, 0));
+
+    auto call = fir::CallOp::create(builder, loc, fn, operands);
+    if (returnsStatus)
+      fir::runtime::genRaiseOctaStatus(builder, loc, call.getResult(0));
+    if (resultByRef)
+      return fir::LoadOp::create(builder, loc, slot);
+    return call.getResult(0);
+  };
+
+  // Spill an i256 argument: the library takes octa_t by pointer.
+  auto spill = [&]() -> mlir::Value {
+    mlir::Value slot = fir::AllocaOp::create(builder, loc, i256);
+    fir::StoreOp::create(builder, loc, val, slot);
+    return slot;
+  };
+
+  if (toTy == i256) {
+    // Into REAL(32). Widening from any of these is exact, so no rounding mode
+    // and no status: binary32, binary64 and every integer kind up to 64 bits
+    // fit in 237 bits of significand with the exponent range to spare.
+    if (mlir::isa<mlir::Float32Type>(fromTy))
+      return callConv("octa_from_float", i256, fromTy, /*resultByRef=*/true,
+                      /*hasRnd=*/false, /*returnsStatus=*/false);
+    if (mlir::isa<mlir::Float64Type>(fromTy))
+      return callConv("octa_from_double", i256, fromTy, true, false, false);
+    if (auto intTy = mlir::dyn_cast<mlir::IntegerType>(fromTy)) {
+      // INTEGER(16) is i128 and does not fit in 64 bits; it is rejected rather
+      // than silently truncated, which is the defect this function exists to
+      // remove.
+      if (intTy.getWidth() > 64)
+        return {};
+      val = builder.createConvert(loc, builder.getIntegerType(64), val);
+      return callConv("octa_from_int64", i256, builder.getIntegerType(64), true,
+                      false, false);
+    }
+    return {};
+  }
+
+  if (fromTy == i256) {
+    // Out of REAL(32). These narrow, so each reports its rounding through the
+    // status word and each takes an explicit mode.
+    val = spill();
+    if (mlir::isa<mlir::Float32Type>(toTy))
+      return callConv("octa_to_float", toTy, refI256, true, true, true);
+    if (mlir::isa<mlir::Float64Type>(toTy))
+      return callConv("octa_to_double_r", toTy, refI256, true, true, true);
+    if (auto intTy = mlir::dyn_cast<mlir::IntegerType>(toTy)) {
+      if (intTy.getWidth() > 64)
+        return {};
+      mlir::Value i64 =
+          callConv("octa_to_int64", builder.getIntegerType(64), refI256, true,
+                   false, true);
+      return builder.createConvert(loc, toTy, i64);
+    }
+    return {};
+  }
+
+  return {};
+}
+
 /// Compare two REAL(32) values.
 ///
 /// liboctamath answers with two things rather than one:
@@ -1806,6 +1927,13 @@ struct UnaryOp<
     }
     mlir::Type type = Fortran::lower::getFIRType(builder.getContext(), TC1,
                                                  KIND, /*params=*/{});
+    // REAL(32) is i256, so convertWithSemantics below would treat every
+    // conversion involving it as an integer conversion and silently produce a
+    // wrong value. Intercept before it can.
+    mlir::Type i256 = builder.getIntegerType(256);
+    if (type == i256 || lhs.getType() == i256)
+      if (mlir::Value res = genOctaConvert(loc, builder, type, lhs))
+        return hlfir::EntityWithAttributes{res};
     mlir::Value res = builder.convertWithSemantics(loc, type, lhs);
     return hlfir::EntityWithAttributes{res};
   }
