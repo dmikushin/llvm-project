@@ -220,6 +220,15 @@ endif ()
 # Indicates REAL(16) support via an external library (e.g. libquadmath).
 add_compile_definitions(FLANG_RT_SUPPORTS_REAL16=$<BOOL:${FORTRAN_SUPPORTS_REAL16}>)
 
+# Marks a translation unit as part of the runtime rather than of the compiler.
+# flang/lib/Decimal is compiled into both, and they have different constraints:
+# the runtime is freestanding and has no C++ allocator, so an instantiation
+# whose storage exceeds the inline threshold in big-radix-floating-point.h
+# compiles here and then fails to link. RT_DEVICE_COMPILATION does not cover
+# it - the case is the ordinary host runtime, and it shows up only when a
+# Fortran program is linked, never when the runtime itself is built.
+add_compile_definitions(FLANG_RT_BUILD=1)
+
 # Check whether the compiler can undefine a macro using the "-Wp,-U" flag.
 # Aternatively, we could use
 #   CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "GNU"

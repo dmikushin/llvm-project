@@ -71,9 +71,25 @@ static LLVMTypeID defaultRealKind(KindTy kind) {
     return LLVMTypeID::X86_FP80TyID;
   case 16:
     return LLVMTypeID::FP128TyID;
+  case 32:
+    // REAL(32) is IEEE binary256 and has no llvm::Type::TypeID at all, so
+    // there is no honest value to return. Falling through to `default` would
+    // give FloatTyID - kind 32 answered as a 32-bit float - and every caller
+    // downstream would then work with a type 224 bits narrower than the one it
+    // asked about, with nothing to say so. That is not hypothetical: it is why
+    // the intrinsic table was built for (f32) -> f32 while lowering asked for
+    // (i256) -> i256, so no row matched and SQRT reported "not yet
+    // implemented" rather than anything about precision.
+    //
+    // Lowering does not reach here - FirOpBuilder::getRealType answers kind 32
+    // first. Anything that does is asking a question this map cannot answer.
+    llvm::report_fatal_error(
+        "REAL(32) has no LLVM type: it is carried as i256");
+    break;
   default:
     return LLVMTypeID::FloatTyID;
   }
+  llvm_unreachable("defaultRealKind fell through");
 }
 
 // lookup the kind-value given the defaults, the mappings, and a KIND key

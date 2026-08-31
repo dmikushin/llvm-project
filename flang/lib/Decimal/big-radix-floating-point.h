@@ -57,10 +57,13 @@ static constexpr std::uint64_t TenToThe(int power) {
 // flang/Decimal/decimal.h stop at binary128, so no device instantiation ever
 // crosses the threshold.
 //
-// Above it the storage moves to the heap. That path exists for binary256,
-// which is only ever instantiated in the compiler and in the host runtime,
-// where operator new is available and where 384 KiB of stack in one frame is
-// not something to spend.
+// Above it the storage moves to the heap. That path is for the compiler only.
+// It is NOT available in flang-rt, on a device or on the host: the runtime is
+// freestanding and supplies no operator new[]/delete[]. An earlier version of
+// this comment claimed the host runtime had them, and that mistake cost a
+// link failure in every Fortran program once binary256 was instantiated - the
+// runtime itself built cleanly, because undefined symbols in an archive are
+// only a problem when something links against it.
 template <typename D, int N, bool Heap = (sizeof(D) * N > 64 * 1024)>
 class DigitStorage {
 public:
@@ -72,21 +75,22 @@ private:
 };
 
 template <typename D, int N> class DigitStorage<D, N, true> {
-#ifdef RT_DEVICE_COMPILATION
-  // The argument above - that no device instantiation crosses the threshold,
-  // because the explicit instantiations stop at binary128 - is true today and
-  // is exactly the kind of reasoning a later edit invalidates without noticing.
-  // Adding ConvertToDecimal<237> to binary-to-decimal.cpp is the natural next
-  // step when REAL(32) arrives, and it would silently put an operator new and
-  // a 128 KiB allocation into the offload build. Everything would compile.
+#if defined(RT_DEVICE_COMPILATION) || defined(FLANG_RT_BUILD)
+  // The argument that no runtime instantiation crosses the threshold - because
+  // the explicit instantiations stop at binary128 - is true today and is
+  // exactly the kind of reasoning a later edit invalidates without noticing.
+  // Adding ConvertToDecimal<237> is the natural next step when REAL(32)
+  // arrives; it was taken, and it put an operator new[] into flang-rt, where
+  // every compile succeeded and every link of a user program failed.
   //
   // So the argument is a check rather than a comment. sizeof(D) == 0 is
   // dependent, so this fires when the heap specialisation is instantiated for
-  // a device and not before.
+  // the runtime and not before.
   static_assert(sizeof(D) == 0,
       "BigRadixFloatingPointNumber was instantiated at a precision whose digit "
-      "array exceeds the inline threshold, while compiling for a device. That "
-      "would allocate on the heap in device code. Either keep the device "
+      "array exceeds the inline threshold, while compiling flang-rt. The "
+      "runtime is freestanding and has no operator new[], so this compiles and "
+      "then fails to link every Fortran program. Either keep the runtime "
       "instantiations below the threshold, or give this class a "
       "caller-supplied buffer.");
 #endif

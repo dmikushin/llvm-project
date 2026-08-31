@@ -334,11 +334,25 @@ template ConversionToDecimalResult ConvertToDecimal<64>(char *, std::size_t,
 template ConversionToDecimalResult ConvertToDecimal<113>(char *, std::size_t,
     enum DecimalConversionFlags, int, enum FortranRounding,
     BinaryFloatingPointNumber<113>);
-#ifndef RT_DEVICE_COMPILATION
-// binary256. Deliberately not instantiated for a device: its digit array is
-// 128 KiB and crosses the threshold in big-radix-floating-point.h, where the
-// storage moves to the heap. The static_assert there enforces this rather
-// than trusting the present list to stay as it is.
+#if !defined(RT_DEVICE_COMPILATION) && !defined(FLANG_RT_BUILD)
+// binary256, for the compiler only.
+//
+// The digit array is 128 KiB, which crosses the threshold in
+// big-radix-floating-point.h where the storage moves to the heap. The compiler
+// can allocate; flang-rt cannot - it is freestanding and supplies no
+// operator new[]/delete[] - so instantiating this there compiles and then
+// fails to link every Fortran program with "undefined reference to
+// operator new[]". Note where that failure lands: at the link of a *user*
+// program, never at the build of the runtime, so a clean flang-rt build does
+// not clear it.
+//
+// The device exclusion is the same rule for the same reason, and the
+// static_assert in big-radix-floating-point.h enforces it rather than trusting
+// this list to stay as it is.
+//
+// Nothing in the runtime needs this yet: REAL(32) has no output formatting.
+// Giving it one requires a buffer strategy that does not allocate, not simply
+// removing this guard.
 template ConversionToDecimalResult ConvertToDecimal<237>(char *, std::size_t,
     enum DecimalConversionFlags, int, enum FortranRounding,
     BinaryFloatingPointNumber<237>);

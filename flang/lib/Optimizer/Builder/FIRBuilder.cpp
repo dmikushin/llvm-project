@@ -120,6 +120,16 @@ mlir::Type fir::FirOpBuilder::getVarLenSeqTy(mlir::Type eleTy, unsigned rank) {
 }
 
 mlir::Type fir::FirOpBuilder::getRealType(int kind) {
+  // REAL(32) is answered before the kind map is consulted, and that order is
+  // load-bearing. binary256 has no llvm::Type::TypeID, so a lookup falls
+  // through to defaultRealKind, whose `default` arm returns FloatTyID: kind 32
+  // comes back as a 32-bit float. Not a crash - a silently narrowed type. It
+  // is how the intrinsic table came to be built for (f32) -> f32 while
+  // lowering asked for (i256) -> i256, so no row ever matched and SQRT
+  // reported "not yet implemented" rather than anything about precision.
+  // See genRealType in Lower/ConvertType.cpp for why the carrier is i256.
+  if (kind == 32)
+    return mlir::IntegerType::get(getContext(), 256);
   switch (kindMap.getRealTypeID(kind)) {
   case llvm::Type::TypeID::HalfTyID:
     return mlir::Float16Type::get(getContext());
