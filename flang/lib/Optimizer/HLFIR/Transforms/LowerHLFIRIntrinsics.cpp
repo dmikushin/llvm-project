@@ -190,6 +190,97 @@ static unsigned getKindForType(mlir::Type ty) {
   return width / 8;
 }
 
+// --- REAL(32) reductions -------------------------------------------------
+//
+// REAL(32) is IEEE binary256 carried as an opaque i256, so there is no runtime
+// kernel to call: the runtime's reductions are templated over a C++ element
+// type and binary256 has none. Every operation on the type is a call into
+// liboctamath, and a reduction is no different - it is a loop of them.
+//
+// This is emitted here, in the always-run lowering, rather than in
+// SimplifyHLFIRIntrinsics where the loop machinery already exists, because
+// that pass only runs above -O0. A reduction that is inlined at -O2 and
+// dispatched to a runtime kernel at -O0 would give this type two different
+// implementations, and the defect this replaced was exactly a difference
+// between optimisation levels: SUM of four 1.0_oct returned -2.014e78912 at
+// -O2 and refused to compile at -O0.
+//
+// Scope: total reductions without a MASK. DIM and MASK still take the runtime
+// path and still fail loudly there, which is the honest outcome for something
+// unimplemented - see the arr32 test for what is covered.
+
+/// Emit `int octa_<name>(octa_t *r, const octa_t *a, const octa_t *b, int)`
+/// and return the loaded result. Mirrors genLibOctaCall in IntrinsicCall.cpp:
+/// the library takes and returns binary256 by pointer, so the operands are
+/// spilled to allocas.
+static mlir::Value genOctaBinary(mlir::Location loc, fir::FirOpBuilder &builder,
+                                 llvm::StringRef name, mlir::Value a,
+                                 mlir::Value b) {
+  mlir::Type i256 = builder.getIntegerType(256);
+  mlir::Type ref = fir::ReferenceType::get(i256);
+  mlir::Type i32 = builder.getI32Type();
+  llvm::SmallVector<mlir::Type> argTys{ref, ref, ref, i32};
+  mlir::func::FuncOp fn = builder.getNamedFunction(name);
+  if (!fn)
+    fn = builder.createFunction(loc, name,
+                                builder.getFunctionType(argTys, {i32}));
+
+  mlir::Value result = fir::AllocaOp::create(builder, loc, i256);
+  mlir::Value slotA = fir::AllocaOp::create(builder, loc, i256);
+  mlir::Value slotB = fir::AllocaOp::create(builder, loc, i256);
+  fir::StoreOp::create(builder, loc, a, slotA);
+  fir::StoreOp::create(builder, loc, b, slotB);
+  mlir::Value rnd = builder.createIntegerConstant(loc, i32, 0);
+  fir::CallOp::create(builder, loc, fn,
+                      mlir::ValueRange{result, slotA, slotB, rnd});
+  return fir::LoadOp::create(builder, loc, result);
+}
+
+/// Emit `int octa_cmp(const octa_t *a, const octa_t *b, int *unordered)` and
+/// return its -1/0/1 code. If \p unorderedOut is non-null it receives the
+/// unordered flag, which is reported separately rather than folded into the
+/// code precisely so that a caller cannot ignore NaN by accident.
+static mlir::Value genOctaCmp(mlir::Location loc, fir::FirOpBuilder &builder,
+                              mlir::Value a, mlir::Value b,
+                              mlir::Value *unorderedOut = nullptr) {
+  mlir::Type i256 = builder.getIntegerType(256);
+  mlir::Type ref = fir::ReferenceType::get(i256);
+  mlir::Type i32 = builder.getI32Type();
+  mlir::Type i32ref = fir::ReferenceType::get(i32);
+  mlir::func::FuncOp fn = builder.getNamedFunction("octa_cmp");
+  if (!fn)
+    fn = builder.createFunction(
+        loc, "octa_cmp", builder.getFunctionType({ref, ref, i32ref}, {i32}));
+
+  mlir::Value slotA = fir::AllocaOp::create(builder, loc, i256);
+  mlir::Value slotB = fir::AllocaOp::create(builder, loc, i256);
+  mlir::Value unordered = fir::AllocaOp::create(builder, loc, i32);
+  fir::StoreOp::create(builder, loc, a, slotA);
+  fir::StoreOp::create(builder, loc, b, slotB);
+  mlir::Value code = fir::CallOp::create(builder, loc, fn,
+                                         mlir::ValueRange{slotA, slotB,
+                                                          unordered})
+                         .getResult(0);
+  if (unorderedOut)
+    *unorderedOut = fir::LoadOp::create(builder, loc, unordered);
+  return code;
+}
+
+/// A binary256 constant, given as the four 64-bit words of the interchange
+/// encoding with w3 first. Spelled from the format rather than borrowed from
+/// a header so that the bit positions are visible where they are used:
+/// sign in bit 63 of w3, then 19 exponent bits, bias 262143.
+static mlir::Value genOcta(mlir::Location loc, fir::FirOpBuilder &builder,
+                           uint64_t w3, uint64_t rest) {
+  llvm::APInt v(256, w3);
+  v <<= 192;
+  if (rest)
+    v |= llvm::APInt::getLowBitsSet(256, 192);
+  return mlir::arith::ConstantOp::create(
+      builder, loc, builder.getIntegerType(256),
+      builder.getIntegerAttr(builder.getIntegerType(256), v));
+}
+
 template <class OP>
 class HlfirReductionIntrinsicConversion : public HlfirIntrinsicConversion<OP> {
   using HlfirIntrinsicConversion<OP>::HlfirIntrinsicConversion;
@@ -235,6 +326,116 @@ protected:
     return lowerArguments(operation, inArgs, rewriter, argLowering);
   };
 
+  /// Total SUM/PRODUCT/MAXVAL/MINVAL over a REAL(32) array, as a loop of
+  /// liboctamath calls.
+  ///
+  /// The empty-array answers are the standard's and are not what the loop
+  /// produces: SUM is 0, PRODUCT is 1, MAXVAL is -HUGE and MINVAL is +HUGE.
+  /// For MAXVAL and MINVAL the loop is seeded with -/+ infinity instead,
+  /// because seeding with -/+ HUGE would return HUGE for an array whose
+  /// elements are all infinite. The two are reconciled after the loop by
+  /// selecting on whether the array had any elements at all, so neither case
+  /// is traded for the other.
+  llvm::LogicalResult genOctaReduction(OP operation, llvm::StringRef opName,
+                                       fir::FirOpBuilder &builder,
+                                       mlir::Location loc, hlfir::Entity array,
+                                       mlir::PatternRewriter &rewriter) const {
+    constexpr bool isSum = std::is_same_v<OP, hlfir::SumOp>;
+    constexpr bool isProduct = std::is_same_v<OP, hlfir::ProductOp>;
+    constexpr bool isMax = std::is_same_v<OP, hlfir::MaxvalOp>;
+
+    // 1.0 has exponent 262143 = 0x3FFFF in bits 62..44 and a zero fraction;
+    // an infinity has the exponent all ones, 0x7FFFF; HUGE has 0x7FFFE and
+    // every fraction bit set. The sign is bit 63.
+    mlir::Value init;
+    if constexpr (isSum)
+      init = genOcta(loc, builder, 0, 0);
+    else if constexpr (isProduct)
+      init = genOcta(loc, builder, 0x3FFFF00000000000ULL, 0);
+    else if constexpr (isMax)
+      init = genOcta(loc, builder, 0xFFFFF00000000000ULL, 0); // -infinity
+    else
+      init = genOcta(loc, builder, 0x7FFFF00000000000ULL, 0); // +infinity
+
+    llvm::SmallVector<mlir::Value> extents =
+        hlfir::genExtentsVector(loc, builder, array);
+
+    // SUM carries a compensation term as a second loop-carried value. That is
+    // not a refinement of my own: flang-rt/lib/runtime/sum.cpp accumulates
+    // every other real kind with Kahan summation, and a REAL(32) that summed
+    // naively would be the one kind that behaves differently. The extra width
+    // is not an argument against it - binary64 has 53 bits and compensates,
+    // and the cancellation Kahan repairs is proportional to the number of
+    // terms, not to the format.
+    llvm::SmallVector<mlir::Value> inits{init};
+    if constexpr (isSum)
+      inits.push_back(genOcta(loc, builder, 0, 0)); // correction
+
+    auto body = [&](mlir::Location l, fir::FirOpBuilder &b,
+                    mlir::ValueRange idx,
+                    mlir::ValueRange acc) -> llvm::SmallVector<mlir::Value> {
+      hlfir::Entity elem = hlfir::loadElementAt(l, b, array, idx);
+      mlir::Value cur = acc[0];
+      if constexpr (isSum) {
+        mlir::Value corr = acc[1];
+        mlir::Value next = genOctaBinary(l, b, "octa_sub", elem, corr);
+        // Both arms are computed and selected rather than branched on: each
+        // is a handful of library calls, and control flow here would have to
+        // be threaded through the reduction values by hand.
+        mlir::Value sumIfNan = genOctaBinary(l, b, "octa_add", cur, elem);
+        mlir::Value sumOk = genOctaBinary(l, b, "octa_add", cur, next);
+        mlir::Value diff = genOctaBinary(l, b, "octa_sub", sumOk, cur);
+        mlir::Value corrOk = genOctaBinary(l, b, "octa_sub", diff, next);
+        // next != next, i.e. an Inf - Inf that produced a NaN correction.
+        mlir::Value unordered;
+        (void)genOctaCmp(l, b, next, next, &unordered);
+        mlir::Value zeroI32 = b.createIntegerConstant(l, b.getI32Type(), 0);
+        mlir::Value isNan = mlir::arith::CmpIOp::create(
+            b, l, mlir::arith::CmpIPredicate::ne, unordered, zeroI32);
+        mlir::Value zero = genOcta(l, b, 0, 0);
+        return {mlir::arith::SelectOp::create(b, l, isNan, sumIfNan, sumOk),
+                mlir::arith::SelectOp::create(b, l, isNan, zero, corrOk)};
+      } else if constexpr (isProduct) {
+        return {genOctaBinary(l, b, "octa_mul", cur, elem)};
+      } else {
+        mlir::Value code = genOctaCmp(l, b, elem, cur);
+        mlir::Value zero = b.createIntegerConstant(l, b.getI32Type(), 0);
+        mlir::Value take = mlir::arith::CmpIOp::create(
+            b, l,
+            isMax ? mlir::arith::CmpIPredicate::sgt
+                  : mlir::arith::CmpIPredicate::slt,
+            code, zero);
+        return {mlir::arith::SelectOp::create(b, l, take, elem, cur)};
+      }
+    };
+
+    llvm::SmallVector<mlir::Value> result = hlfir::genLoopNestWithReductions(
+        loc, builder, extents, inits, body, /*isUnordered=*/false);
+    mlir::Value reduced = result[0];
+
+    if constexpr (!isSum && !isProduct) {
+      // Replace the infinity seed with the standard's empty-array answer when
+      // the array turned out to be empty. Without this MAXVAL of a
+      // zero-sized array returns -infinity where Fortran says -HUGE.
+      mlir::Value count = builder.createIntegerConstant(
+          loc, builder.getIndexType(), 1);
+      for (mlir::Value e : extents)
+        count = mlir::arith::MulIOp::create(builder, loc, count, e);
+      mlir::Value zeroIdx =
+          builder.createIntegerConstant(loc, builder.getIndexType(), 0);
+      mlir::Value empty = mlir::arith::CmpIOp::create(
+          builder, loc, mlir::arith::CmpIPredicate::eq, count, zeroIdx);
+      mlir::Value huge =
+          isMax ? genOcta(loc, builder, 0xFFFFEFFFFFFFFFFFULL, 1)
+                : genOcta(loc, builder, 0x7FFFEFFFFFFFFFFFULL, 1);
+      reduced =
+          mlir::arith::SelectOp::create(builder, loc, empty, huge, reduced);
+    }
+
+    rewriter.replaceOp(operation, reduced);
+    return mlir::success();
+  }
+
 public:
   llvm::LogicalResult
   matchAndRewrite(OP operation,
@@ -262,6 +463,20 @@ public:
 
     fir::FirOpBuilder builder{rewriter, operation.getOperation()};
     const mlir::Location &loc = operation->getLoc();
+
+    // REAL(32) has no runtime kernel; the reduction is a loop of liboctamath
+    // calls, emitted here. Only total reductions without a MASK are covered -
+    // anything else falls through to the runtime path and fails there by name.
+    if constexpr (std::is_same_v<OP, hlfir::SumOp> ||
+                  std::is_same_v<OP, hlfir::ProductOp> ||
+                  std::is_same_v<OP, hlfir::MaxvalOp> ||
+                  std::is_same_v<OP, hlfir::MinvalOp>) {
+      hlfir::Entity array{operation.getArray()};
+      mlir::Type eleTy = hlfir::getFortranElementType(array.getType());
+      if (eleTy.isInteger(256) && !operation.getDim() && !operation.getMask())
+        return genOctaReduction(operation, opName, builder, loc, array,
+                                rewriter);
+    }
 
     mlir::Type i32 = builder.getI32Type();
     mlir::Type logicalType = fir::LogicalType::get(

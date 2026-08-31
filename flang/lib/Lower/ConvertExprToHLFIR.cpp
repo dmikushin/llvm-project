@@ -1867,6 +1867,41 @@ struct UnaryOp<Fortran::evaluate::Negate<
   }
 };
 
+/// REAL(32) is an opaque i256, so arith.negf cannot take it. Negation is not
+/// routed through octa_sub(0, x) either: that would turn -0.0 into +0.0 and a
+/// NaN into a different NaN, and both are wrong. octa_neg flips the sign bit,
+/// which is what Fortran's unary minus means.
+///
+/// It gets its own emitter rather than reusing genOctaCall because its
+/// signature is genuinely different - `void octa_neg(octa_t *r, const octa_t
+/// *x)`, with no rounding mode and no status. Reusing genOctaCall would emit a
+/// three-argument call to a two-argument function and then read a return value
+/// that does not exist; the extra argument is harmless on this ABI, but the
+/// garbage in the return register would be handed to genRaiseOctaStatus and
+/// would raise whatever IEEE exceptions it happened to look like.
+template <>
+struct UnaryOp<Fortran::evaluate::Negate<
+    Fortran::evaluate::Type<Fortran::common::TypeCategory::Real, 32>>> {
+  using Op = Fortran::evaluate::Negate<
+      Fortran::evaluate::Type<Fortran::common::TypeCategory::Real, 32>>;
+  static hlfir::EntityWithAttributes gen(mlir::Location loc,
+                                         fir::FirOpBuilder &builder, const Op &,
+                                         hlfir::Entity lhs) {
+    mlir::Type i256 = builder.getIntegerType(256);
+    mlir::Type ref = fir::ReferenceType::get(i256);
+    mlir::func::FuncOp fn = builder.getNamedFunction("octa_neg");
+    if (!fn)
+      fn = builder.createFunction(loc, "octa_neg",
+                                  builder.getFunctionType({ref, ref}, {}));
+    mlir::Value result = fir::AllocaOp::create(builder, loc, i256);
+    mlir::Value slot = fir::AllocaOp::create(builder, loc, i256);
+    fir::StoreOp::create(builder, loc, lhs, slot);
+    fir::CallOp::create(builder, loc, fn, mlir::ValueRange{result, slot});
+    return hlfir::EntityWithAttributes{
+        fir::LoadOp::create(builder, loc, result)};
+  }
+};
+
 template <int KIND>
 struct UnaryOp<Fortran::evaluate::Negate<
     Fortran::evaluate::Type<Fortran::common::TypeCategory::Complex, KIND>>> {

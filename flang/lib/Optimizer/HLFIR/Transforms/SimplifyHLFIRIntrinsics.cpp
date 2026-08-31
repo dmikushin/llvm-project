@@ -1140,6 +1140,25 @@ private:
 };
 
 mlir::LogicalResult ReductionAsElementalConverter::convert() {
+  // REAL(32) is IEEE binary256 carried as an opaque i256, so every one of the
+  // arith operations these converters build is the wrong operation for it:
+  // there is no arith op that adds two binary256 values, and i256 satisfies
+  // the integer ones. Rejected here rather than in each subclass's
+  // isConvertible(), which is `final` in two of them and would have to be
+  // remembered in every converter added later.
+  //
+  // This is not a missing optimisation. Without it SUM and PRODUCT are
+  // silently wrong at -O1 and above - sum of four 1.0_oct returned
+  // -2.014e78912, which is the four bit patterns added as 256-bit integers
+  // and read back as a real - while MAXVAL and MINVAL crash the compiler in
+  // APInt::getSExtValue, because the initial value does not fit in an int64_t.
+  // At -O0 the same programs fail loudly in the runtime dispatch. An
+  // optimisation level that turns a refusal into a wrong answer is the worst
+  // of the three outcomes, and it is the one this removes.
+  if (getSourceElementType().isInteger(256))
+    return rewriter.notifyMatchFailure(
+        op, "REAL(32) is an opaque i256; arith cannot reduce it");
+
   mlir::LogicalResult canConvert(isConvertible());
 
   if (mlir::failed(canConvert))

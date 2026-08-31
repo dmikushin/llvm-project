@@ -69,6 +69,19 @@ static mlir::Attribute convertToAttribute(
     else
       return builder.getIntegerAttr(type, value.word().ToInt64());
   } else {
+    if constexpr (TC == Fortran::common::TypeCategory::Real && KIND == 32) {
+      // REAL(32) is an opaque i256, so its attribute is an IntegerAttr over
+      // the bit pattern, exactly as the scalar path below builds. Without
+      // this the getFloatAttr lambda asks the kind map for binary256 float
+      // semantics, which do not exist, and lowering dies in defaultRealKind.
+      //
+      // This is the array-constant path and it is separate from the scalar
+      // one: `x = 1.0_oct` worked while `a = [1.0_oct, 2.0_oct]` did not, so
+      // fixing the scalar case left a hole exactly where a test would put its
+      // data.
+      return builder.getIntegerAttr(
+          type, llvm::APInt(256, value.RawBits().Hexadecimal(), 16));
+    }
     auto getFloatAttr = [&](const auto &value, mlir::Type type) {
       std::string str = value.DumpHexadecimal();
       auto floatVal =
