@@ -21,8 +21,11 @@ subroutine s(var)
   !AIX_WARNING: underflow on REAL(10) to REAL(4) conversion
   real :: realvar8 = 4.0E6_10
   real :: realvar9 = 4.0E6_16
-  !ERROR: Unsupported REAL(KIND=32)
+  ! Kind 32 is binary256 and is now supported; the diagnostic this line used
+  ! to carry has moved out to a kind that still is not.
   real :: realvar10 = 4.0E6_32
+  !ERROR: Unsupported REAL(KIND=64)
+  real :: realvar11 = 4.0E6_64
 
   double precision :: doublevar1 = 4.0E6_4
   double precision :: doublevar2 = 4.0D6
@@ -35,6 +38,7 @@ subroutine s(var)
   !AIX_WARNING: underflow on REAL(10) to REAL(8) conversion
   double precision :: doublevar7 = 4.0E6_10
   double precision :: doublevar8 = 4.0E6_16
-  !ERROR: Unsupported REAL(KIND=32)
   double precision :: doublevar9 = 4.0E6_32
+  !ERROR: Unsupported REAL(KIND=64)
+  double precision :: doublevar10 = 4.0E6_64
 end subroutine s

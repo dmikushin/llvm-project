@@ -1,4 +1,4 @@
-! REQUIRES: x86_64-registered-target
+! REQUIRES: x86-registered-target
 ! RUN: %python %S/test_errors.py %s %flang_fc1
 ! C712 The value of scalar-int-constant-expr shall be nonnegative and
 ! shall specify a representation method that exists on the processor.
@@ -30,8 +30,12 @@ real(kind=-1) :: am1
 real(kind=1) :: a1
 !ERROR: REAL(KIND=7) is not a supported type
 real(kind=7) :: a7
-!ERROR: REAL(KIND=32) is not a supported type
+! REAL(KIND=32) is binary256, and is supported. The unsupported-kind
+! diagnostic is still exercised, one kind further out, so that removing the
+! error here does not remove the coverage with it.
 real(kind=32) :: a32
+!ERROR: REAL(KIND=64) is not a supported type
+real(kind=64) :: a64
 !ERROR: COMPLEX(KIND=0) is not a supported type
 complex(kind=0) :: z0
 !ERROR: COMPLEX(KIND=-1) is not a supported type
@@ -40,14 +44,18 @@ complex(kind=-1) :: zm1
 complex(kind=1) :: z1
 !ERROR: COMPLEX(KIND=7) is not a supported type
 complex(kind=7) :: z7
-!ERROR: COMPLEX(KIND=32) is not a supported type
 complex(kind=32) :: z32
+!ERROR: COMPLEX(KIND=64) is not a supported type
+complex(kind=64) :: z64
 !ERROR: COMPLEX*1 is not a supported type
 complex*1 :: zs1
-!ERROR: COMPLEX*2 is not a supported type
+!ERROR: COMPLEX(KIND=1) is not a supported type
 complex*2 :: zs2
-!ERROR: COMPLEX*64 is not a supported type
+! COMPLEX*64 is two 32-byte parts, i.e. COMPLEX(KIND=32), and is now
+! supported; the byte-length form of the diagnostic moves out with it.
 complex*64 :: zs64
+!ERROR: COMPLEX(KIND=64) is not a supported type
+complex*128 :: zs128
 !ERROR: LOGICAL(KIND=0) is not a supported type
 logical(kind=0) :: l0
 !ERROR: LOGICAL(KIND=-1) is not a supported type
