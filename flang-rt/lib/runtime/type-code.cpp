@@ -72,6 +72,9 @@ RT_API_ATTRS TypeCode::TypeCode(TypeCategory f, int kind) {
     case 16:
       raw_ = CFI_type_float128;
       break;
+    case 32:
+      raw_ = CFI_type_float256;
+      break;
     }
     break;
   case TypeCategory::Complex:
@@ -93,6 +96,9 @@ RT_API_ATTRS TypeCode::TypeCode(TypeCategory f, int kind) {
       break;
     case 16:
       raw_ = CFI_type_float128_Complex;
+      break;
+    case 32:
+      raw_ = CFI_type_float256_Complex;
       break;
     }
     break;
@@ -196,6 +202,8 @@ TypeCode::GetCategoryAndKind() const {
     return std::make_pair(TypeCategory::Real, 16);
   case CFI_type_float128:
     return std::make_pair(TypeCategory::Real, 16);
+  case CFI_type_float256:
+    return std::make_pair(TypeCategory::Real, 32);
   case CFI_type_half_float_Complex:
     return std::make_pair(TypeCategory::Complex, 2);
   case CFI_type_bfloat_Complex:
@@ -210,6 +218,8 @@ TypeCode::GetCategoryAndKind() const {
     return std::make_pair(TypeCategory::Complex, 16);
   case CFI_type_float128_Complex:
     return std::make_pair(TypeCategory::Complex, 16);
+  case CFI_type_float256_Complex:
+    return std::make_pair(TypeCategory::Complex, 32);
   case CFI_type_Bool:
     return std::make_pair(TypeCategory::Logical, 1);
   case CFI_type_char:

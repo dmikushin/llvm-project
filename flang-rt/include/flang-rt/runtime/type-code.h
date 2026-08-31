@@ -33,11 +33,18 @@ public:
     return raw_ >= CFI_type_signed_char && raw_ <= CFI_type_ptrdiff_t;
   }
   constexpr RT_API_ATTRS bool IsReal() const {
-    return raw_ >= CFI_type_half_float && raw_ <= CFI_type_float128;
+    // binary256 is named separately rather than folded into the range. The
+    // range runs half_float..float128 (25..31) and the codes after it are
+    // already taken, so a new real kind cannot extend it without renumbering
+    // the ones in between - and those are burned into every object file
+    // already compiled. Naming it is the cheaper half of that trade.
+    return (raw_ >= CFI_type_half_float && raw_ <= CFI_type_float128) ||
+        raw_ == CFI_type_float256;
   }
   constexpr RT_API_ATTRS bool IsComplex() const {
-    return raw_ >= CFI_type_half_float_Complex &&
-        raw_ <= CFI_type_float128_Complex;
+    return (raw_ >= CFI_type_half_float_Complex &&
+               raw_ <= CFI_type_float128_Complex) ||
+        raw_ == CFI_type_float256_Complex;
   }
   constexpr RT_API_ATTRS bool IsCharacter() const {
     return raw_ == CFI_type_char || raw_ == CFI_type_char16_t ||

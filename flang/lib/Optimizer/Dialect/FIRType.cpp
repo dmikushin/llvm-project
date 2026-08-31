@@ -520,6 +520,22 @@ int getTypeCode(mlir::Type ty, const fir::KindMapping &kindMap) {
         return CFI_type_int64_t;
       case 128:
         return CFI_type_int128_t;
+      case 256:
+        // REAL(32) is IEEE binary256 carried as an opaque i256, so a descriptor
+        // for one arrives here as an integer and must not be described as one.
+        // Without this case the compiler aborts outright - measured, by
+        // deleting it: `llvm_unreachable("unsupported integer type")` on any
+        // REAL(32) array. Which code is returned is not yet observable, because
+        // element size comes from the descriptor's byte length rather than from
+        // the type code and nothing reachable reads the code today; it becomes
+        // load-bearing as soon as formatted output, reductions or C interop do.
+        //
+        // The mapping is unambiguous only because i256 has exactly one meaning
+        // in FIR today: Fortran's widest integer kind is 16, so nothing else
+        // produces this width. An INTEGER(32) would make this line unable to
+        // tell the two apart, and the blob would have to carry its category
+        // some other way. That constraint belongs here, where the ambiguity is.
+        return CFI_type_float256;
       }
       llvm_unreachable("unsupported integer type");
     }

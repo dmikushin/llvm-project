@@ -356,6 +356,8 @@ static const char *GetTypeStr(ISO::CFI_type_t type, bool dumpRawType) {
       CASE(CFI_type_uint32_t)
       CASE(CFI_type_uint64_t)
       CASE(CFI_type_uint128_t)
+      CASE(CFI_type_float256)
+      CASE(CFI_type_float256_Complex)
     default:
       return nullptr;
     }

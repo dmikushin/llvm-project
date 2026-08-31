@@ -178,6 +178,15 @@ mlirTypeToCategoryKind(mlir::Location loc, mlir::Type type) {
     return {type.isUnsignedInteger() ? Fortran::common::TypeCategory::Unsigned
                                      : Fortran::common::TypeCategory::Integer,
             16};
+  else if (type.isInteger(256))
+    // REAL(32) is IEEE binary256 carried as an opaque i256, so it reaches here
+    // as an integer and has to be named as the real it is. This pair chooses a
+    // runtime entry point: answering Integer/32 would hand a binary256 array
+    // to an integer reduction, which would read the same bytes as two's
+    // complement and return a number rather than fail. The one-meaning-per-
+    // width assumption is the same one fir::getTypeCode relies on, and it
+    // breaks in the same place if INTEGER(32) is ever added.
+    return {Fortran::common::TypeCategory::Real, 32};
   else if (auto logicalType = mlir::dyn_cast<fir::LogicalType>(type))
     return {Fortran::common::TypeCategory::Logical, logicalType.getFKind()};
   else if (auto charType = mlir::dyn_cast<fir::CharacterType>(type))

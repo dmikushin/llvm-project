@@ -42,6 +42,7 @@ inline int complexBitsToTypeCode(unsigned bitwidth) {
   case 64:  return CFI_type_double_Complex;
   case 80:  return CFI_type_extended_double_Complex;
   case 128: return CFI_type_float128_Complex;
+  case 256: return CFI_type_float256_Complex;
   default:  llvm_unreachable("unsupported complex size");
   }
   // clang-format on
@@ -80,6 +81,7 @@ inline int realBitsToTypeCode(unsigned bitwidth) {
   case 64:  return CFI_type_double;
   case 80:  return CFI_type_extended_double;
   case 128: return CFI_type_float128;
+  case 256: return CFI_type_float256;
   default:  llvm_unreachable("unsupported real size");
   }
   // clang-format on

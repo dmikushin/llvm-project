@@ -101,7 +101,9 @@ typedef signed char CFI_type_t;
 #define CFI_type_uint32_t 47
 #define CFI_type_uint64_t 48
 #define CFI_type_uint128_t 49
-#define CFI_TYPE_LAST CFI_type_uint128_t
+#define CFI_type_float256 50 /* extension: kind=32 */
+#define CFI_type_float256_Complex 51 /* extension: kind=32 */
+#define CFI_TYPE_LAST CFI_type_float256_Complex
 #define CFI_type_other (-1) // must be negative
 
 /* Error code macros - skip some of the small values to avoid conflicts with

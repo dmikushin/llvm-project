@@ -1262,6 +1262,102 @@ GENBIN_OCTA(Subtract, "octa_sub")
 GENBIN_OCTA(Multiply, "octa_mul")
 GENBIN_OCTA(Divide, "octa_div")
 
+/// Compare two REAL(32) values.
+///
+/// liboctamath answers with two things rather than one:
+///     int octa_cmp(const octa_t *a, const octa_t *b, int *unordered);
+/// returning -1/0/1, and setting `unordered` when either operand is NaN. The
+/// split is deliberate on that side and has to be respected on this one: an
+/// ordering code alone cannot express "neither less, nor equal, nor greater",
+/// so any scheme that folds NaN into the -1/0/1 answer has already lost.
+///
+/// Each of the six operators is therefore derived from the pair directly, and
+/// none is derived from another by negation. That is the whole difficulty
+/// here. With a NaN operand Fortran requires `<` `>` `<=` `>=` `==` to be
+/// false and `/=` to be true, so `==` and `/=` are not complements when a NaN
+/// is involved - they are both false-and-true respectively for reasons that do
+/// not cancel. Writing `EQ` as `!NE` gives the right answer on every ordered
+/// pair and the wrong one on every NaN, which is exactly the shape of defect
+/// that survives casual testing.
+static mlir::Value genOctaCmp(mlir::Location loc, fir::FirOpBuilder &builder,
+                              Fortran::common::RelationalOperator rop,
+                              mlir::Value lhs, mlir::Value rhs) {
+  mlir::Type i256 = builder.getIntegerType(256);
+  mlir::Type refI256 = fir::ReferenceType::get(i256);
+  mlir::Type i32 = builder.getI32Type();
+  mlir::Type refI32 = fir::ReferenceType::get(i32);
+
+  mlir::func::FuncOp fn = builder.createFunction(
+      loc, "octa_cmp",
+      builder.getFunctionType({refI256, refI256, refI32}, {i32}));
+
+  mlir::Value lhsSlot = fir::AllocaOp::create(builder, loc, i256);
+  mlir::Value rhsSlot = fir::AllocaOp::create(builder, loc, i256);
+  mlir::Value unordSlot = fir::AllocaOp::create(builder, loc, i32);
+  fir::StoreOp::create(builder, loc, lhs, lhsSlot);
+  fir::StoreOp::create(builder, loc, rhs, rhsSlot);
+
+  auto call = fir::CallOp::create(builder, loc, fn,
+                                  mlir::ValueRange{lhsSlot, rhsSlot,
+                                                   unordSlot});
+  mlir::Value code = call.getResult(0);
+  mlir::Value unord = fir::LoadOp::create(builder, loc, unordSlot);
+
+  mlir::Value zero = builder.createIntegerConstant(loc, i32, 0);
+  mlir::Value isUnordered = mlir::arith::CmpIOp::create(
+      builder, loc, mlir::arith::CmpIPredicate::ne, unord, zero);
+  mlir::Value isOrdered = mlir::arith::CmpIOp::create(
+      builder, loc, mlir::arith::CmpIPredicate::eq, unord, zero);
+
+  // The ordering half of each operator, asked of the -1/0/1 code.
+  mlir::arith::CmpIPredicate pred;
+  switch (rop) {
+  case Fortran::common::RelationalOperator::LT:
+    pred = mlir::arith::CmpIPredicate::slt;
+    break;
+  case Fortran::common::RelationalOperator::LE:
+    pred = mlir::arith::CmpIPredicate::sle;
+    break;
+  case Fortran::common::RelationalOperator::EQ:
+    pred = mlir::arith::CmpIPredicate::eq;
+    break;
+  case Fortran::common::RelationalOperator::NE:
+    pred = mlir::arith::CmpIPredicate::ne;
+    break;
+  case Fortran::common::RelationalOperator::GT:
+    pred = mlir::arith::CmpIPredicate::sgt;
+    break;
+  case Fortran::common::RelationalOperator::GE:
+    pred = mlir::arith::CmpIPredicate::sge;
+    break;
+  }
+  mlir::Value ordered =
+      mlir::arith::CmpIOp::create(builder, loc, pred, code, zero);
+
+  // NE is the one operator that is true *because* of unorderedness; every
+  // other one requires the operands to be ordered before its ordering test
+  // means anything. Note that when unordered is set the code is 0, so the NE
+  // ordering test is false and the disjunction is carrying the whole answer -
+  // which is correct, and is why this is an `or` and not an `and`.
+  if (rop == Fortran::common::RelationalOperator::NE)
+    return mlir::arith::OrIOp::create(builder, loc, ordered, isUnordered);
+  return mlir::arith::AndIOp::create(builder, loc, ordered, isOrdered);
+}
+
+template <>
+struct BinaryOp<Fortran::evaluate::Relational<
+    Fortran::evaluate::Type<Fortran::common::TypeCategory::Real, 32>>> {
+  using Op = Fortran::evaluate::Relational<
+      Fortran::evaluate::Type<Fortran::common::TypeCategory::Real, 32>>;
+  static hlfir::EntityWithAttributes gen(mlir::Location loc,
+                                         fir::FirOpBuilder &builder,
+                                         const Op &op, hlfir::Entity lhs,
+                                         hlfir::Entity rhs) {
+    return hlfir::EntityWithAttributes{
+        genOctaCmp(loc, builder, op.opr, lhs, rhs)};
+  }
+};
+
 template <int KIND>
 struct BinaryOp<Fortran::evaluate::Divide<
     Fortran::evaluate::Type<Fortran::common::TypeCategory::Complex, KIND>>> {
