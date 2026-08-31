@@ -20,6 +20,7 @@
 #include "flang/Optimizer/Builder/CUFCommon.h"
 #include "flang/Optimizer/Builder/Character.h"
 #include "flang/Optimizer/Builder/Complex.h"
+#include "flang/Optimizer/Builder/HLFIRTools.h"
 #include "flang/Optimizer/Builder/FIRBuilder.h"
 #include "flang/Optimizer/Builder/MIFCommon.h"
 #include "flang/Optimizer/Builder/MutableBox.h"
@@ -1218,6 +1219,80 @@ static mlir::Value genLibOctaCall(fir::FirOpBuilder &builder,
       fir::CallOp::create(builder, loc, funcOp, operands).getResult(0);
   fir::runtime::genRaiseOctaStatus(builder, loc, status);
   return fir::LoadOp::create(builder, loc, result);
+}
+
+/// Emit `int octa_<name>(octa_t *r, const octa_t *a, const octa_t *b, int)`
+/// on two loaded binary256 values and return the loaded result.
+///
+/// The same shape as genLibOctaCall above, but reachable without a
+/// MathOperation table entry: NORM2 and DOT_PRODUCT are array operations, so
+/// they are loops of these rather than rows in the elementwise table.
+static mlir::Value genOctaBin(fir::FirOpBuilder &builder, mlir::Location loc,
+                              llvm::StringRef name, mlir::Value a,
+                              mlir::Value b) {
+  mlir::Type i256 = builder.getIntegerType(256);
+  mlir::Type ref = fir::ReferenceType::get(i256);
+  mlir::Type i32 = builder.getI32Type();
+  mlir::func::FuncOp fn = builder.getNamedFunction(name);
+  if (!fn)
+    fn = builder.createFunction(loc, name,
+                                builder.getFunctionType({ref, ref, ref, i32},
+                                                        {i32}));
+  mlir::Value result = fir::AllocaOp::create(builder, loc, i256);
+  mlir::Value slotA = fir::AllocaOp::create(builder, loc, i256);
+  mlir::Value slotB = fir::AllocaOp::create(builder, loc, i256);
+  fir::StoreOp::create(builder, loc, a, slotA);
+  fir::StoreOp::create(builder, loc, b, slotB);
+  mlir::Value rnd = builder.createIntegerConstant(loc, i32, 0);
+  mlir::Value status =
+      fir::CallOp::create(builder, loc, fn,
+                          mlir::ValueRange{result, slotA, slotB, rnd})
+          .getResult(0);
+  fir::runtime::genRaiseOctaStatus(builder, loc, status);
+  return fir::LoadOp::create(builder, loc, result);
+}
+
+/// A binary256 zero.
+static mlir::Value genOctaZero(fir::FirOpBuilder &builder, mlir::Location loc) {
+  mlir::Type i256 = builder.getIntegerType(256);
+  return mlir::arith::ConstantOp::create(
+      builder, loc, i256, builder.getIntegerAttr(i256, llvm::APInt(256, 0)));
+}
+
+/// NORM2 over a REAL(32) array, as a loop of octa_hypot.
+///
+/// Deliberately not sqrt(sum(x*x)). Squaring overflows for any element beyond
+/// sqrt(HUGE) - about 1e39456 here - and flushes to zero below sqrt(TINY),
+/// while the norm itself is perfectly representable in both cases. That is the
+/// reason hypot exists as a primitive rather than as a formula, and the wide
+/// exponent range of binary256 is an argument for care rather than against it:
+/// it does not remove the failure, it moves it out to arguments nobody thinks
+/// to test.
+///
+/// hypot(hypot(...), x) accumulates instead. Each step is correctly rounded and
+/// cannot overflow unless the true result does, so the error grows with the
+/// number of elements rather than jumping to infinity on one of them. The
+/// alternative - two passes, scaling by the largest magnitude - needs the
+/// maximum before it can start and buys accuracy this does not need.
+static mlir::Value genOctaNorm2(fir::FirOpBuilder &builder, mlir::Location loc,
+                                hlfir::Entity array) {
+  llvm::SmallVector<mlir::Value> extents =
+      hlfir::genExtentsVector(loc, builder, array);
+  llvm::SmallVector<mlir::Value> inits{genOctaZero(builder, loc)};
+
+  auto body = [&](mlir::Location l, fir::FirOpBuilder &b, mlir::ValueRange idx,
+                  mlir::ValueRange acc) -> llvm::SmallVector<mlir::Value> {
+    hlfir::Entity elem = hlfir::loadElementAt(l, b, array, idx);
+    // hypot takes |x| itself, so no absolute value is needed and none is
+    // taken: octa_hypot is symmetric in sign by construction.
+    return {genOctaBin(b, l, "octa_hypot", acc[0], elem)};
+  };
+
+  // An empty array gives the zero seed, which is what NORM2 of a zero-sized
+  // array is required to be, so no reconciliation is needed here - unlike
+  // MAXVAL, whose identity element is not its empty-array answer.
+  return hlfir::genLoopNestWithReductions(loc, builder, extents, inits, body,
+                                          /*isUnordered=*/false)[0];
 }
 
 /// Mapping between mathematical intrinsic operations and MLIR operations
@@ -7324,6 +7399,18 @@ IntrinsicLibrary::genNorm2(mlir::Type resultType,
 
   // Check if the dim argument is present
   bool absentDim = isStaticallyAbsent(args[1]);
+
+  // REAL(32) has no runtime kernel - the runtime's NORM2 is templated over a
+  // C++ element type and binary256 has none, which is what the abort in
+  // mlirTypeToIntrinsicFortran was reporting. The total case becomes a loop of
+  // liboctamath calls here, in lowering, so it does not depend on which passes
+  // run. NORM2 with DIM still takes the runtime path and still fails there by
+  // name, which is the honest outcome for something unimplemented.
+  if (fir::unwrapSequenceType(fir::unwrapPassByRefType(array.getType()))
+          .isInteger(256)) {
+    if (absentDim || rank == 1)
+      return genOctaNorm2(builder, loc, hlfir::Entity{array});
+  }
 
   // If dim argument is absent or the array is rank 1, then the result is
   // a scalar (since the the result is rank-1 or 0). Otherwise, the result is

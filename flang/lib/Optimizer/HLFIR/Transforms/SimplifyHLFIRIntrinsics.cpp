@@ -3032,6 +3032,16 @@ public:
     if (!op.isScalar())
       return rewriter.notifyMatchFailure(product, "produces non-scalar result");
 
+    // REAL(32) is an opaque i256, and every arith operation this converter
+    // builds is the wrong one for it - i256 satisfies the integer ones, so the
+    // rewrite succeeds and computes bit patterns. Same reasoning, and the same
+    // measured consequence, as the reduction converters above: without this,
+    // DOT_PRODUCT would answer differently at -O0 and -O2. The loop of
+    // liboctamath calls is emitted in LowerHLFIRIntrinsics, which always runs.
+    if (product.getType().isInteger(256))
+      return rewriter.notifyMatchFailure(
+          product, "REAL(32) is an opaque i256; arith cannot multiply it");
+
     mlir::Location loc = product.getLoc();
     fir::FirOpBuilder builder{rewriter, product.getOperation()};
     hlfir::Entity lhs = hlfir::Entity{product.getLhs()};

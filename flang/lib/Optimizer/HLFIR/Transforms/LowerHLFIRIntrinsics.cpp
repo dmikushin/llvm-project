@@ -592,6 +592,54 @@ struct DotProductOpConversion
     : public HlfirIntrinsicConversion<hlfir::DotProductOp> {
   using HlfirIntrinsicConversion<hlfir::DotProductOp>::HlfirIntrinsicConversion;
 
+  /// DOT_PRODUCT over REAL(32), as a compensated loop of liboctamath calls.
+  ///
+  /// The summation compensates for the same reason SUM does:
+  /// flang-rt/lib/runtime/dot-product.cpp accumulates every other real kind
+  /// with a compensated sum, and a REAL(32) that added naively would be the one
+  /// kind that behaved differently. The width is not an argument against it -
+  /// the cancellation Kahan repairs grows with the number of terms, not with
+  /// the format.
+  ///
+  /// Each product is one octa_mul and so is correctly rounded; what the
+  /// compensation repairs is the accumulation across terms.
+  mlir::Value genOctaDotProduct(fir::FirOpBuilder &builder, mlir::Location loc,
+                                hlfir::Entity lhs, hlfir::Entity rhs) const {
+    llvm::SmallVector<mlir::Value> extents =
+        hlfir::genExtentsVector(loc, builder, lhs);
+    llvm::SmallVector<mlir::Value> inits{genOcta(loc, builder, 0, 0),
+                                         genOcta(loc, builder, 0, 0)};
+
+    auto body = [&](mlir::Location l, fir::FirOpBuilder &b, mlir::ValueRange idx,
+                    mlir::ValueRange acc) -> llvm::SmallVector<mlir::Value> {
+      hlfir::Entity a = hlfir::loadElementAt(l, b, lhs, idx);
+      hlfir::Entity c = hlfir::loadElementAt(l, b, rhs, idx);
+      mlir::Value prod = genOctaBinary(l, b, "octa_mul", a, c);
+      mlir::Value sum = acc[0], corr = acc[1];
+      mlir::Value next = genOctaBinary(l, b, "octa_sub", prod, corr);
+      mlir::Value sumIfNan = genOctaBinary(l, b, "octa_add", sum, prod);
+      mlir::Value sumOk = genOctaBinary(l, b, "octa_add", sum, next);
+      mlir::Value diff = genOctaBinary(l, b, "octa_sub", sumOk, sum);
+      mlir::Value corrOk = genOctaBinary(l, b, "octa_sub", diff, next);
+      // An Inf - Inf in the correction makes it NaN and would poison a sum
+      // that is otherwise well defined; drop the compensation in that case,
+      // exactly as the SUM lowering does.
+      mlir::Value unordered;
+      (void)genOctaCmp(l, b, next, next, &unordered);
+      mlir::Value zeroI32 = b.createIntegerConstant(l, b.getI32Type(), 0);
+      mlir::Value isNan = mlir::arith::CmpIOp::create(
+          b, l, mlir::arith::CmpIPredicate::ne, unordered, zeroI32);
+      mlir::Value zero = genOcta(l, b, 0, 0);
+      return {mlir::arith::SelectOp::create(b, l, isNan, sumIfNan, sumOk),
+              mlir::arith::SelectOp::create(b, l, isNan, zero, corrOk)};
+    };
+
+    // A zero-sized DOT_PRODUCT is zero, which is the seed, so there is nothing
+    // to reconcile afterwards.
+    return hlfir::genLoopNestWithReductions(loc, builder, extents, inits, body,
+                                            /*isUnordered=*/false)[0];
+  }
+
   llvm::LogicalResult
   matchAndRewrite(hlfir::DotProductOp dotProduct,
                   mlir::PatternRewriter &rewriter) const override {
@@ -600,6 +648,18 @@ struct DotProductOpConversion
 
     mlir::Value lhs = dotProduct.getLhs();
     mlir::Value rhs = dotProduct.getRhs();
+
+    // REAL(32) has no runtime kernel. COMPLEX(KIND=32) is deliberately not
+    // handled here: DOT_PRODUCT conjugates its first argument for complex
+    // operands, and getting that wrong is a silent sign error rather than a
+    // failure. It still reaches the runtime and still fails there by name.
+    if (hlfir::getFortranElementType(dotProduct.getType()).isInteger(256)) {
+      mlir::Value result = genOctaDotProduct(builder, loc, hlfir::Entity{lhs},
+                                             hlfir::Entity{rhs});
+      rewriter.replaceOp(dotProduct, result);
+      return mlir::success();
+    }
+
     llvm::SmallVector<IntrinsicArgument, 2> inArgs;
     inArgs.push_back({lhs, lhs.getType()});
     inArgs.push_back({rhs, rhs.getType()});
