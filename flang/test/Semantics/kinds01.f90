@@ -1,4 +1,11 @@
-! REQUIRES: x86_64-registered-target
+! REQUIRES: x86-registered-target, flang-supports-f128-math
+! The f128 requirement is not decoration. This file declares REAL(16)
+! and COMPLEX(16), which are rejected outright on a build configured
+! without a quad math library, and until the target requirement above
+! was corrected nobody could have known: it named x86_64-registered-target,
+! while flang/test/lit.cfg.py registers arch.lower() + "-registered-target",
+! which for target X86 is x86-registered-target. The two never matched, so
+! this file was skipped in every configuration from 2bfb3bae6971 onward.
 ! RUN: %python %S/test_symbols.py %s %flang_fc1
  !DEF: /MainProgram1/jk1 ObjectEntity INTEGER(1)
  integer(kind=1) jk1
