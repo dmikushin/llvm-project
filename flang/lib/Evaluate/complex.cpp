@@ -133,4 +133,5 @@ template class Complex<Real<Integer<32>, 24>>;
 template class Complex<Real<Integer<64>, 53>>;
 template class Complex<Real<X87IntegerContainer, 64>>;
 template class Complex<Real<Integer<128>, 113>>;
+template class Complex<Real<Integer<256>, 237>>;
 } // namespace Fortran::evaluate::value

@@ -72,6 +72,25 @@ private:
 };
 
 template <typename D, int N> class DigitStorage<D, N, true> {
+#ifdef RT_DEVICE_COMPILATION
+  // The argument above - that no device instantiation crosses the threshold,
+  // because the explicit instantiations stop at binary128 - is true today and
+  // is exactly the kind of reasoning a later edit invalidates without noticing.
+  // Adding ConvertToDecimal<237> to binary-to-decimal.cpp is the natural next
+  // step when REAL(32) arrives, and it would silently put an operator new and
+  // a 128 KiB allocation into the offload build. Everything would compile.
+  //
+  // So the argument is a check rather than a comment. sizeof(D) == 0 is
+  // dependent, so this fires when the heap specialisation is instantiated for
+  // a device and not before.
+  static_assert(sizeof(D) == 0,
+      "BigRadixFloatingPointNumber was instantiated at a precision whose digit "
+      "array exceeds the inline threshold, while compiling for a device. That "
+      "would allocate on the heap in device code. Either keep the device "
+      "instantiations below the threshold, or give this class a "
+      "caller-supplied buffer.");
+#endif
+
 public:
   DigitStorage() : d_{new D[N]} {}
   ~DigitStorage() { delete[] d_; }
@@ -197,8 +216,12 @@ private:
   // Sets *this to an unsigned integer value.
   // Returns any remainder.
   template <typename UINT> RT_API_ATTRS UINT SetTo(UINT n) {
-    static_assert(
-        std::is_same_v<UINT, common::uint128_t> || std::is_unsigned_v<UINT>);
+    // Asks whether UINT is unsigned, rather than listing the types that are.
+    // The previous form named uint128_t explicitly because std::is_unsigned_v
+    // does not see a class-typed composed integer; binary256 brought a second
+    // such type and would have needed a third name here, and a fourth at the
+    // next width.
+    static_assert(common::IsUnsignedInteger<UINT>);
     SetToZero();
     while (n != 0) {
       auto q{n / 10u};

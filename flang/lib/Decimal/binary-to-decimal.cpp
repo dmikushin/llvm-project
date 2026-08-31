@@ -334,6 +334,15 @@ template ConversionToDecimalResult ConvertToDecimal<64>(char *, std::size_t,
 template ConversionToDecimalResult ConvertToDecimal<113>(char *, std::size_t,
     enum DecimalConversionFlags, int, enum FortranRounding,
     BinaryFloatingPointNumber<113>);
+#ifndef RT_DEVICE_COMPILATION
+// binary256. Deliberately not instantiated for a device: its digit array is
+// 128 KiB and crosses the threshold in big-radix-floating-point.h, where the
+// storage moves to the heap. The static_assert there enforces this rather
+// than trusting the present list to stay as it is.
+template ConversionToDecimalResult ConvertToDecimal<237>(char *, std::size_t,
+    enum DecimalConversionFlags, int, enum FortranRounding,
+    BinaryFloatingPointNumber<237>);
+#endif
 
 extern "C" {
 RT_EXT_API_GROUP_BEGIN

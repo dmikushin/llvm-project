@@ -532,6 +532,11 @@ template ConversionToBinaryResult<64> ConvertToBinary<64>(
     const char *&, enum FortranRounding, const char *end);
 template ConversionToBinaryResult<113> ConvertToBinary<113>(
     const char *&, enum FortranRounding, const char *end);
+#ifndef RT_DEVICE_COMPILATION
+// binary256; see the note beside ConvertToDecimal<237>.
+template ConversionToBinaryResult<237> ConvertToBinary<237>(
+    const char *&, enum FortranRounding, const char *end);
+#endif
 
 extern "C" {
 RT_EXT_API_GROUP_BEGIN

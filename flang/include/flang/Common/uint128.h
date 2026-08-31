@@ -375,6 +375,25 @@ using SignedInt256 = IntBase<uint128_t, true>;
 using uint256_t = UnsignedInt256;
 using int256_t = SignedInt256;
 
+// Is T an unsigned integer, whether the compiler's or one of the composed
+// ones above? std::is_unsigned_v answers only for arithmetic types, so a
+// class-typed IntBase is invisible to it, and callers were making up the
+// difference by naming uint128_t explicitly. That works until the next width
+// arrives and then fails at the point of use, which is how the addition of
+// binary256 was first noticed: a static_assert in the decimal library that
+// spelled out `is_same_v<UINT, uint128_t> || is_unsigned_v<UINT>`.
+//
+// A property, asked once, rather than a list of names repeated at every site
+// that needs it.
+template <typename T> struct IsUnsignedIntegerHelper {
+  static constexpr bool value{std::is_unsigned_v<T>};
+};
+template <typename HALF> struct IsUnsignedIntegerHelper<IntBase<HALF, false>> {
+  static constexpr bool value{true};
+};
+template <typename T>
+inline constexpr bool IsUnsignedInteger{IsUnsignedIntegerHelper<T>::value};
+
 template <int BITS> struct HostUnsignedIntTypeHelper {
   using type = std::conditional_t<(BITS <= 8), std::uint8_t,
       std::conditional_t<(BITS <= 16), std::uint16_t,
