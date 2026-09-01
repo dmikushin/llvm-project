@@ -23,6 +23,31 @@ RT_API_ATTRS bool EditIntegerInput(
 template <int KIND>
 RT_API_ATTRS bool EditRealInput(IoStatementState &, const DataEdit &, void *);
 
+/// Scan one REAL input field and hand back its decimal text.
+///
+/// This exists for REAL(32). Every other kind is converted inside the runtime
+/// by EditRealInput, which ends in decimal::ConvertToBinary at a precision
+/// instantiated there; binary256 is not among them, because the buffers that
+/// width needs would have to come from a heap the freestanding runtime does
+/// not have. So the division of labour is the same one list-directed output
+/// already uses: the runtime owns records, fields and the input format, and
+/// the caller owns the decimal-to-binary conversion.
+///
+/// The text written is what EditRealInput would have converted - a normalised
+/// fraction with an optional leading '-', a radix point, and an 'e' exponent
+/// when one is needed - and it is NUL-terminated. That form is ordinary
+/// decimal notation, so any correctly rounding parser reproduces the value
+/// the runtime would have produced.
+///
+/// Returns false on a malformed field, on a hexadecimal one (0X..., which is
+/// an extension this path does not carry), and when the field needs more
+/// characters than the buffer holds. The last case signals an error rather
+/// than truncating: a truncated decimal string is a different number, and
+/// silently reading a different number is the failure this whole line of work
+/// exists to prevent.
+RT_API_ATTRS bool ScanRealInputToDecimal(
+    IoStatementState &, const DataEdit &, char *buffer, std::size_t bufferSize);
+
 RT_API_ATTRS bool EditLogicalInput(
     IoStatementState &, const DataEdit &, bool &);
 

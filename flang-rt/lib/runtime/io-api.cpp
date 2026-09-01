@@ -1127,6 +1127,32 @@ bool IODEF(InputInteger)(Cookie cookie, std::int64_t &n, int kind) {
   return false;
 }
 
+bool IODEF(InputPreformattedReal)(
+    Cookie cookie, char *buffer, std::size_t bufferSize) {
+  IoStatementState &io{*cookie};
+  if (!buffer || bufferSize == 0) {
+    io.GetIoErrorHandler().Crash(
+        "Null or empty buffer for preformatted real input item");
+    return false;
+  }
+  if (!io.BeginReadingRecord()) {
+    return false;
+  }
+  auto edit{io.GetNextDataEdit()};
+  if (!edit) {
+    return false;
+  }
+  if (edit->descriptor == DataEdit::ListDirectedNullValue) {
+    // A null value leaves the variable alone, so there is nothing to convert.
+    // The empty string says so: the caller assigns only when it gets digits,
+    // which is what makes `read(*,*) x` on a bare comma preserve x rather than
+    // silently zeroing it.
+    buffer[0] = '\0';
+    return true;
+  }
+  return ScanRealInputToDecimal(io, *edit, buffer, bufferSize);
+}
+
 bool IODEF(InputReal32)(Cookie cookie, float &x) {
   if (!cookie->CheckFormattedStmtType<Direction::Input>("InputReal32")) {
     return false;

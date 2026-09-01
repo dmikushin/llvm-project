@@ -792,6 +792,42 @@ ConvertHexadecimal(
       static_cast<decimal::ConversionResultFlags>(flags)};
 }
 
+// Append "e" and a decimal exponent to a scanned fraction, returning the new
+// length. Factored out so that ScanRealInputToDecimal produces byte-identical
+// text to what EditCommonRealInput converts: two copies of this would be two
+// places for the two paths to drift apart, and the whole point of the scanning
+// path is that it yields the same number the runtime would have produced.
+//
+// The exponent is written in full rather than clamped. It used to be capped at
+// 9999 on the grounds that anything larger "will convert to +/-Inf", which is
+// true of every kind the runtime converts itself - binary128 reaches about
+// 1e4932 - and false of binary256, whose ordinary range runs past 1e78913. The
+// cap turned huge(1.0_oct) into an infinity on the way back in. Writing the
+// true exponent costs a few characters and leaves the decision to the
+// conversion, which is where it belongs: a value too large for the target
+// still becomes an infinity, and one that is not, does not.
+static RT_API_ATTRS int AppendDecimalExponent(
+    char *buffer, int got, int exponent) {
+  if (exponent != 0) {
+    buffer[got++] = 'e';
+    if (exponent < 0) {
+      buffer[got++] = '-';
+      exponent = -exponent;
+    }
+    char digits[8];
+    int n{0};
+    do {
+      digits[n++] = '0' + exponent % 10;
+      exponent /= 10;
+    } while (exponent > 0 && n < static_cast<int>(sizeof digits));
+    while (n > 0) {
+      buffer[got++] = digits[--n];
+    }
+  }
+  buffer[got] = '\0';
+  return got;
+}
+
 template <int KIND>
 RT_API_ATTRS bool EditCommonRealInput(
     IoStatementState &io, const DataEdit &edit, void *n) {
@@ -826,42 +862,7 @@ RT_API_ATTRS bool EditCommonRealInput(
         p, edit.modes.round, scanned.exponent);
   } else {
     bool hadExtra{got > maxDigits};
-    int exponent{scanned.exponent};
-    if (exponent != 0) {
-      buffer[got++] = 'e';
-      if (exponent < 0) {
-        buffer[got++] = '-';
-        exponent = -exponent;
-      }
-      if (exponent > 9999) {
-        exponent = 9999; // will convert to +/-Inf
-      }
-      if (exponent > 999) {
-        int dig{exponent / 1000};
-        buffer[got++] = '0' + dig;
-        int rest{exponent - 1000 * dig};
-        dig = rest / 100;
-        buffer[got++] = '0' + dig;
-        rest -= 100 * dig;
-        dig = rest / 10;
-        buffer[got++] = '0' + dig;
-        buffer[got++] = '0' + (rest - 10 * dig);
-      } else if (exponent > 99) {
-        int dig{exponent / 100};
-        buffer[got++] = '0' + dig;
-        int rest{exponent - 100 * dig};
-        dig = rest / 10;
-        buffer[got++] = '0' + dig;
-        buffer[got++] = '0' + (rest - 10 * dig);
-      } else if (exponent > 9) {
-        int dig{exponent / 10};
-        buffer[got++] = '0' + dig;
-        buffer[got++] = '0' + (exponent - 10 * dig);
-      } else {
-        buffer[got++] = '0' + exponent;
-      }
-    }
-    buffer[got] = '\0';
+    got = AppendDecimalExponent(buffer, got, scanned.exponent);
     converted = decimal::ConvertToBinary<binaryPrecision>(p, edit.modes.round);
     if (hadExtra) {
       converted.flags = static_cast<enum decimal::ConversionResultFlags>(
@@ -886,6 +887,53 @@ RT_API_ATTRS bool EditCommonRealInput(
     }
     RaiseFPExceptions(converted.flags);
   }
+  return CheckCompleteListDirectedField(io, edit);
+}
+
+RT_API_ATTRS bool ScanRealInputToDecimal(IoStatementState &io,
+    const DataEdit &edit, char *buffer, std::size_t bufferSize) {
+  // No fast path here. TryFastPathRealDecimalInput converts straight into a
+  // binary type of a precision instantiated in the runtime, which is the one
+  // thing this function exists because binary256 cannot do.
+  if (bufferSize < 8) {
+    io.GetIoErrorHandler().Crash(
+        "ScanRealInputToDecimal: buffer of %zu is too small for any field",
+        bufferSize);
+    return false;
+  }
+  // ScanRealInput reports overflow by returning a length past the size it was
+  // given, so it is given room for the exponent it does not write: 'e', a
+  // sign, four digits and the terminator, with a little to spare.
+  int scanLimit{static_cast<int>(bufferSize) - 12};
+  auto scanned{ScanRealInput(buffer, scanLimit, io, edit)};
+  int got{scanned.got};
+  if (got >= scanLimit) {
+    const auto &connection{io.GetConnectionState()};
+    io.GetIoErrorHandler().SignalError(IostatBadRealInput,
+        "REAL(KIND=32) input field of %d characters exceeds the %d the "
+        "compiler provided, at column %d of record %d",
+        got, scanLimit, static_cast<int>(connection.positionInRecord + 1),
+        static_cast<int>(connection.currentRecordNumber));
+    return false;
+  }
+  if (got == 0) {
+    const auto &connection{io.GetConnectionState()};
+    io.GetIoErrorHandler().SignalError(IostatBadRealInput,
+        "Bad real input data at column %d of record %d",
+        static_cast<int>(connection.positionInRecord + 1),
+        static_cast<int>(connection.currentRecordNumber));
+    return false;
+  }
+  if (scanned.isHexadecimal) {
+    // 0X... input carries a binary exponent and is converted by a separate
+    // routine inside the runtime. Refusing is deliberate: handing the caller
+    // a decimal string here would mean inventing one, and a hexadecimal
+    // literal exists precisely so that no decimal rounding occurs.
+    io.GetIoErrorHandler().SignalError(IostatBadRealInput,
+        "Hexadecimal real input is not supported for REAL(KIND=32)");
+    return false;
+  }
+  AppendDecimalExponent(buffer, got, scanned.exponent);
   return CheckCompleteListDirectedField(io, edit);
 }
 

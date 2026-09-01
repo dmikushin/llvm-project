@@ -1093,6 +1093,97 @@ createIoRuntimeCallForItem(Fortran::lower::AbstractConverter &converter,
 }
 
 /// Generate a sequence of input data transfer calls.
+/// Read a scalar REAL(32) through liboctamath.
+///
+/// The mirror of genOutputReal32, and the division of labour is the same. The
+/// runtime scans the field - it owns records, blank handling, repeat counts and
+/// the difference between a null value and a zero, none of which the compiler
+/// can see - and hands back the decimal text it would itself have converted.
+/// The conversion is done here, by the library that performs every other
+/// operation on this kind, because flang-rt has no decimal conversion at 237
+/// bits and cannot be given one without a heap it does not have.
+///
+/// Before this, the type reached getInputFunc as an i256 and was read by
+/// InputInteger, so `read(*,*) x` failed with "Bad character '.' in INTEGER
+/// input field". Loud, but the type could not round-trip through a file.
+///
+/// The buffer is the compiler's, and its size is the one limit this path
+/// imposes that the runtime's own does not: a field longer than it is an
+/// error rather than a truncation, because a truncated decimal string is a
+/// different number.
+static void genInputReal32(Fortran::lower::AbstractConverter &converter,
+                           mlir::Location loc, mlir::Value cookie,
+                           const Fortran::lower::SomeExpr *expr,
+                           Fortran::lower::StatementContext &stmtCtx,
+                           mlir::Value &ok) {
+  fir::FirOpBuilder &builder = converter.getFirOpBuilder();
+  mlir::Type i256 = builder.getIntegerType(256);
+  mlir::Type i8 = builder.getIntegerType(8);
+  mlir::Type i32 = builder.getI32Type();
+  mlir::Type i64 = builder.getI64Type();
+  mlir::Type i8Ref = fir::ReferenceType::get(i8);
+
+  // A binary256 value needs at most 73 significant digits to round-trip, but
+  // an input field may legitimately carry more before rounding - so this is
+  // sized for a generous field rather than for the format. The runtime signals
+  // an error beyond it instead of reading a prefix.
+  constexpr std::int64_t bufLen = 1024;
+  mlir::Type bufTy = fir::SequenceType::get({bufLen}, i8);
+  mlir::Value buf = fir::AllocaOp::create(builder, loc, bufTy);
+  mlir::Value bufPtr = builder.createConvert(loc, i8Ref, buf);
+
+  mlir::func::FuncOp inputFunc =
+      fir::runtime::getIORuntimeFunc<mkIOKey(InputPreformattedReal)>(loc,
+                                                                    builder);
+  mlir::Type ptrArg = inputFunc.getFunctionType().getInput(1);
+  mlir::Type lenTy = inputFunc.getFunctionType().getInput(2);
+  mlir::Value cap = builder.createIntegerConstant(loc, i64, bufLen);
+  llvm::SmallVector<mlir::Value> args = {
+      cookie, builder.createConvert(loc, ptrArg, bufPtr),
+      builder.createConvert(loc, lenTy, cap)};
+  ok = fir::CallOp::create(builder, loc, inputFunc, args).getResult(0);
+
+  // An empty string is a list-directed null value: the standard says the
+  // variable keeps its previous value, so nothing is assigned. Converting the
+  // empty string instead would store a zero, which is a different answer and a
+  // silent one.
+  mlir::Value first = fir::LoadOp::create(builder, loc, bufPtr);
+  mlir::Value nul = builder.createIntegerConstant(loc, i8, 0);
+  mlir::Value hasText = mlir::arith::CmpIOp::create(
+      builder, loc, mlir::arith::CmpIPredicate::ne, first, nul);
+
+  mlir::Value addr = fir::getBase(converter.genExprAddr(loc, expr, stmtCtx));
+  builder.genIfThen(loc, hasText)
+      .genThen([&]() {
+        mlir::Value slot = fir::AllocaOp::create(builder, loc, i256);
+        // The third parameter is `const char **`, but FIR has no reference to
+        // a reference, so it is declared as an opaque pointer - which is what
+        // it lowers to anyway - and a null of that type is passed.
+        mlir::FunctionType parseTy =
+            builder.getFunctionType({fir::ReferenceType::get(i256), i8Ref,
+                                     i8Ref},
+                                    {i32});
+        mlir::func::FuncOp parseFunc =
+            builder.getNamedFunction("octa_from_string");
+        if (!parseFunc) {
+          parseFunc = builder.createFunction(loc, "octa_from_string", parseTy);
+          parseFunc->setAttr(fir::FIROpsDialect::getFirRuntimeAttrName(),
+                             builder.getUnitAttr());
+        }
+        // The library accepts a null "end" pointer and does not write through
+        // it; the caller here has nothing to do with a trailing position,
+        // because the runtime has already decided where the field ended.
+        mlir::Value nullEnd = builder.createNullConstant(loc, i8Ref);
+        fir::CallOp::create(builder, loc, parseFunc,
+                            mlir::ValueRange{slot, bufPtr, nullEnd});
+        mlir::Value value = fir::LoadOp::create(builder, loc, slot);
+        fir::StoreOp::create(builder, loc, value,
+                             builder.createConvert(
+                                 loc, fir::ReferenceType::get(i256), addr));
+      })
+      .end();
+}
+
 static void genInputItemList(Fortran::lower::AbstractConverter &converter,
                              mlir::Value cookie,
                              const std::list<Fortran::parser::InputItem> &items,
@@ -1138,6 +1229,10 @@ static void genInputItemList(Fortran::lower::AbstractConverter &converter,
         ok = vectorSubscriptBox.loopOverElementsWhile(builder, loc,
                                                       elementalGenerator, ok);
       }
+      continue;
+    }
+    if (isFormatted && isScalarReal32(expr)) {
+      genInputReal32(converter, loc, cookie, expr, stmtCtx, ok);
       continue;
     }
     mlir::Type itemTy = converter.genType(*expr);

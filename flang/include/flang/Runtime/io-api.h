@@ -293,6 +293,26 @@ bool IODECL(OutputAscii)(Cookie, const char *, std::size_t);
 // new record first if it would not fit.
 bool IODECL(OutputPreformattedReal)(Cookie, const char *, std::size_t);
 
+// Scan one REAL input field and return its decimal text, NUL-terminated,
+// without converting it.
+//
+// The mirror of OutputPreformattedReal, and it exists for the same reason:
+// REAL(32) is carried as an opaque 256-bit blob, and flang/lib/Decimal is not
+// instantiated at precision 237 inside flang-rt, so the runtime cannot convert
+// this kind in either direction. The division of labour is therefore the same
+// in both - the runtime owns records, fields and the input format, which the
+// compiler has no way to interpret, and the caller owns the conversion, which
+// it performs with the same library that already does every arithmetic
+// operation on the kind.
+//
+// The text is what the runtime would itself have converted: a normalised
+// fraction with an optional '-', a radix point, and an 'e' exponent when one
+// is needed. Returns false and signals an error on a malformed field, on
+// hexadecimal input, and when the field is longer than the supplied buffer -
+// the last of these rather than truncating, because a truncated decimal string
+// is a different number.
+bool IODECL(InputPreformattedReal)(Cookie, char *, std::size_t);
+
 bool IODECL(InputCharacter)(Cookie, char *, std::size_t, int kind = 1);
 bool IODECL(InputAscii)(Cookie, char *, std::size_t);
 bool IODECL(OutputLogical)(Cookie, bool);

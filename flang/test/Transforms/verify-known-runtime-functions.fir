@@ -58,6 +58,7 @@
 // CHECK-NEXT: func.func private @_FortranAioInputInteger(!fir.ref<i8>, !fir.ref<i64>, i32) -> i1 attributes {fir.io, fir.runtime}
 // CHECK-NEXT: func.func private @_FortranAioInputLogical(!fir.ref<i8>, !fir.ref<i1>) -> i1 attributes {fir.io, fir.runtime}
 // CHECK-NEXT: func.func private @_FortranAioInputNamelist(!fir.ref<i8>, !fir.ref<tuple<>>) -> i1 attributes {fir.io, fir.runtime}
+// CHECK-NEXT: func.func private @_FortranAioInputPreformattedReal(!fir.ref<i8>, !fir.ref<i8>, i64) -> i1 attributes {fir.io, fir.runtime}
 // CHECK-NEXT: func.func private @_FortranAioInputReal32(!fir.ref<i8>, !fir.ref<f32>) -> i1 attributes {fir.io, fir.runtime}
 // CHECK-NEXT: func.func private @_FortranAioInputReal64(!fir.ref<i8>, !fir.ref<f64>) -> i1 attributes {fir.io, fir.runtime}
 // CHECK-NEXT: func.func private @_FortranAioInquireCharacter(!fir.ref<i8>, i64, !fir.ref<i8>, i64) -> i1 attributes {fir.io, fir.runtime}
