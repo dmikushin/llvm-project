@@ -30,6 +30,128 @@
 #include "llvm/Support/CommandLine.h"
 #include <type_traits>
 
+// --- REAL(32) -------------------------------------------------------------
+//
+// REAL(32) is IEEE binary256 carried as an opaque i256, so every operation on
+// it is a call into liboctamath. These mirror the helpers in
+// LowerHLFIRIntrinsics.cpp; they are duplicated rather than shared because
+// that file is a pass in Optimizer and this one is lowering, and a header
+// holding three ten-line emitters would couple them for no gain.
+
+/// A binary256 constant from the four 64-bit words of the interchange
+/// encoding: \p w3 is the most significant, and \p lowOnes sets every one of
+/// the remaining 192 bits. Sign is bit 63 of w3, then 19 exponent bits with
+/// bias 262143.
+static mlir::Value genOctaConst(mlir::Location loc, fir::FirOpBuilder &builder,
+                                uint64_t w3, bool lowOnes) {
+  llvm::APInt v(256, w3);
+  v <<= 192;
+  if (lowOnes)
+    v |= llvm::APInt::getLowBitsSet(256, 192);
+  mlir::Type i256 = builder.getIntegerType(256);
+  return mlir::arith::ConstantOp::create(builder, loc, i256,
+                                         builder.getIntegerAttr(i256, v));
+}
+
+/// Emit `int octa_<name>(octa_t *r, const octa_t *a, const octa_t *b, int)`
+/// and return the loaded result. The library takes and returns binary256 by
+/// pointer, so the operands are spilled to allocas.
+static mlir::Value genOctaBinary(mlir::Location loc, fir::FirOpBuilder &builder,
+                                 llvm::StringRef name, mlir::Value a,
+                                 mlir::Value b) {
+  mlir::Type i256 = builder.getIntegerType(256);
+  mlir::Type ref = fir::ReferenceType::get(i256);
+  mlir::Type i32 = builder.getI32Type();
+  mlir::func::FuncOp fn = builder.getNamedFunction(name);
+  if (!fn)
+    fn = builder.createFunction(
+        loc, name, builder.getFunctionType({ref, ref, ref, i32}, {i32}));
+
+  mlir::Value result = fir::AllocaOp::create(builder, loc, i256);
+  mlir::Value slotA = fir::AllocaOp::create(builder, loc, i256);
+  mlir::Value slotB = fir::AllocaOp::create(builder, loc, i256);
+  fir::StoreOp::create(builder, loc, a, slotA);
+  fir::StoreOp::create(builder, loc, b, slotB);
+  mlir::Value rnd = builder.createIntegerConstant(loc, i32, 0);
+  fir::CallOp::create(builder, loc, fn,
+                      mlir::ValueRange{result, slotA, slotB, rnd});
+  return fir::LoadOp::create(builder, loc, result);
+}
+
+/// Emit `int octa_cmp(const octa_t *a, const octa_t *b, int *unordered)`.
+/// The unordered flag is reported separately rather than folded into the
+/// -1/0/1 code, so that a caller cannot ignore NaN by accident.
+static mlir::Value genOctaCmp(mlir::Location loc, fir::FirOpBuilder &builder,
+                              mlir::Value a, mlir::Value b,
+                              mlir::Value &unorderedOut) {
+  mlir::Type i256 = builder.getIntegerType(256);
+  mlir::Type ref = fir::ReferenceType::get(i256);
+  mlir::Type i32 = builder.getI32Type();
+  mlir::Type i32ref = fir::ReferenceType::get(i32);
+  mlir::func::FuncOp fn = builder.getNamedFunction("octa_cmp");
+  if (!fn)
+    fn = builder.createFunction(
+        loc, "octa_cmp", builder.getFunctionType({ref, ref, i32ref}, {i32}));
+
+  mlir::Value slotA = fir::AllocaOp::create(builder, loc, i256);
+  mlir::Value slotB = fir::AllocaOp::create(builder, loc, i256);
+  mlir::Value unordered = fir::AllocaOp::create(builder, loc, i32);
+  fir::StoreOp::create(builder, loc, a, slotA);
+  fir::StoreOp::create(builder, loc, b, slotB);
+  mlir::Value code =
+      fir::CallOp::create(builder, loc, fn,
+                          mlir::ValueRange{slotA, slotB, unordered})
+          .getResult(0);
+  unorderedOut = fir::LoadOp::create(builder, loc, unordered);
+  return code;
+}
+
+/// Emit `int octa_is_nan(const octa_t *x)` as an i1.
+static mlir::Value genOctaIsNan(mlir::Location loc, fir::FirOpBuilder &builder,
+                                mlir::Value a) {
+  mlir::Type i256 = builder.getIntegerType(256);
+  mlir::Type ref = fir::ReferenceType::get(i256);
+  mlir::Type i32 = builder.getI32Type();
+  mlir::func::FuncOp fn = builder.getNamedFunction("octa_is_nan");
+  if (!fn)
+    fn = builder.createFunction(loc, "octa_is_nan",
+                                builder.getFunctionType({ref}, {i32}));
+  mlir::Value slot = fir::AllocaOp::create(builder, loc, i256);
+  fir::StoreOp::create(builder, loc, a, slot);
+  mlir::Value r =
+      fir::CallOp::create(builder, loc, fn, mlir::ValueRange{slot})
+          .getResult(0);
+  mlir::Value zero = builder.createIntegerConstant(loc, i32, 0);
+  return mlir::arith::CmpIOp::create(builder, loc,
+                                     mlir::arith::CmpIPredicate::ne, r, zero);
+}
+
+/// MAX or MIN of two REAL(32) values with IEEE maxNum/minNum semantics: a NaN
+/// operand yields the other one, which is what arith::MaxNumFOp does for the
+/// kinds that have a float type. Written out rather than reduced to a single
+/// select because "code > 0 ? a : b" alone returns b when b is the NaN -
+/// octa_cmp reports 0 for an unordered pair, and 0 is not greater than 0.
+static mlir::Value genOctaExtremum(mlir::Location loc,
+                                   fir::FirOpBuilder &builder, bool isMax,
+                                   mlir::Value a, mlir::Value b) {
+  mlir::Value unordered;
+  mlir::Value code = genOctaCmp(loc, builder, a, b, unordered);
+  mlir::Type i32 = builder.getI32Type();
+  mlir::Value zero = builder.createIntegerConstant(loc, i32, 0);
+  mlir::Value take = mlir::arith::CmpIOp::create(
+      builder, loc,
+      isMax ? mlir::arith::CmpIPredicate::sgt : mlir::arith::CmpIPredicate::slt,
+      code, zero);
+  mlir::Value ordered = mlir::arith::SelectOp::create(builder, loc, take, a, b);
+
+  mlir::Value isUnordered = mlir::arith::CmpIOp::create(
+      builder, loc, mlir::arith::CmpIPredicate::ne, unordered, zero);
+  mlir::Value aIsNan = genOctaIsNan(loc, builder, a);
+  mlir::Value nanCase = mlir::arith::SelectOp::create(builder, loc, aIsNan, b, a);
+  return mlir::arith::SelectOp::create(builder, loc, isUnordered, nanCase,
+                                       ordered);
+}
+
 static llvm::cl::opt<bool> forceByrefReduction(
     "force-byref-reduction",
     llvm::cl::desc("Pass all reduction arguments by reference"),
@@ -309,6 +431,32 @@ ReductionProcessor::getReductionInitValue(mlir::Location loc, mlir::Type type,
   if (!fir::isa_integer(type) && !fir::isa_real(type) &&
       !fir::isa_complex(type) && !mlir::isa<fir::LogicalType>(type))
     TODO(loc, "Reduction of some types is not supported");
+
+  // REAL(32) is an opaque i256, so `fir::isa_real` is false for it and every
+  // branch below would take the integer path. That is not a matter of the
+  // wrong bits: MAX and MIN ask for getSignedMinValue(256).getSExtValue(),
+  // which does not fit in an int64_t and asserts, while ADD and MULTIPLY
+  // would build the integers 0 and 1 rather than the binary256 values.
+  //
+  // The identities are the ones Fortran names: 0.0 and 1.0, and -HUGE/+HUGE
+  // for MAX/MIN, matching APFloat::getLargest for the kinds that have a float
+  // type. HUGE has exponent 0x7FFFE - one below the all-ones that means
+  // infinity - and every fraction bit set.
+  if (fir::isa_octuple_real(type)) {
+    switch (redId) {
+    case ReductionIdentifier::ADD:
+      return genOctaConst(loc, builder, 0, false);
+    case ReductionIdentifier::MULTIPLY:
+      return genOctaConst(loc, builder, 0x3FFFF00000000000ULL, false);
+    case ReductionIdentifier::MAX:
+      return genOctaConst(loc, builder, 0xFFFFEFFFFFFFFFFFULL, true);
+    case ReductionIdentifier::MIN:
+      return genOctaConst(loc, builder, 0x7FFFEFFFFFFFFFFFULL, true);
+    default:
+      TODO(loc, "OpenMP reduction identifier over REAL(KIND=32)");
+    }
+  }
+
   switch (redId) {
   case ReductionIdentifier::MAX: {
     if (auto ty = mlir::dyn_cast<mlir::FloatType>(type)) {
@@ -393,15 +541,31 @@ mlir::Value ReductionProcessor::createScalarCombiner(
   // REAL(32) is IEEE binary256 carried as an opaque i256. Every combiner below
   // picks its operation with `type.isIntOrIndex()` first, which is true for
   // that carrier, so `reduction(+:x)` over a REAL(32) added bit patterns:
-  // measured before this guard, four additions of 1.0_oct gave
+  // measured before this was handled, four additions of 1.0_oct gave
   // -2.014e78912 - the same wrong number the array SUM defect produced, and
   // at -O0 as well as above it, so no optimisation level reported anything.
   //
-  // Refusing rather than emitting liboctamath calls: the combiner is inlined
-  // into an OpenMP reduction region, and a plausible wrong answer there is
-  // exactly what this work exists to remove. A loud refusal is worth more.
-  if (fir::isa_octuple_real(type))
-    TODO(loc, "OpenMP reduction over REAL(KIND=32)");
+  // The calls go here rather than in a later pass because this is the only
+  // place the combiner is built; the region is afterwards inlined wherever
+  // the reduction needs it, so the operations travel with it.
+  //
+  // Only the four operators that apply to a real are handled. IAND, IOR,
+  // IEOR and the logical ones cannot name a REAL reduction variable, so
+  // reaching them with one is a front-end error rather than a gap here.
+  if (fir::isa_octuple_real(type)) {
+    switch (redId) {
+    case ReductionIdentifier::ADD:
+      return genOctaBinary(loc, builder, "octa_add", op1, op2);
+    case ReductionIdentifier::MULTIPLY:
+      return genOctaBinary(loc, builder, "octa_mul", op1, op2);
+    case ReductionIdentifier::MAX:
+      return genOctaExtremum(loc, builder, /*isMax=*/true, op1, op2);
+    case ReductionIdentifier::MIN:
+      return genOctaExtremum(loc, builder, /*isMax=*/false, op1, op2);
+    default:
+      TODO(loc, "OpenMP reduction operator over REAL(KIND=32)");
+    }
+  }
 
   switch (redId) {
   case ReductionIdentifier::MAX:
