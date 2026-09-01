@@ -1269,6 +1269,53 @@ static mlir::Value genLibOctaCall(fir::FirOpBuilder &builder,
   return fir::LoadOp::create(builder, loc, result);
 }
 
+// `x ** n` on a REAL(32) base with an INTEGER exponent.
+//
+//     int octa_powi(octa_t *r, const octa_t *x, long long n, octa_rnd_t rnd);
+//
+// A separate entry point rather than a conversion of n to REAL(32) followed by
+// octa_pow, because that is wrong exactly where it matters: pow of a negative
+// base is undefined, while `(-2.0_oct) ** 3` is perfectly well defined and is
+// -8. The library keeps the identity (-x)**n = (-1)**n * x**n, so the answer
+// stays one correctly rounded power rather than a chain of multiplications
+// carrying a rounding each.
+static mlir::Value genLibOctaPowI(fir::FirOpBuilder &builder,
+                                  mlir::Location loc,
+                                  const MathOperation &mathOp,
+                                  mlir::FunctionType libFuncType,
+                                  llvm::ArrayRef<mlir::Value> args) {
+  (void)libFuncType;
+  assert(args.size() == 2);
+  mlir::Type i256 = builder.getIntegerType(256);
+  mlir::Type ref = fir::ReferenceType::get(i256);
+  mlir::Type i32 = builder.getI32Type();
+  mlir::Type i64 = builder.getIntegerType(64);
+
+  mlir::func::FuncOp fn = builder.getNamedFunction(mathOp.runtimeFunc);
+  if (!fn) {
+    fn = builder.createFunction(
+        loc, mathOp.runtimeFunc,
+        builder.getFunctionType({ref, ref, i64, i32}, {i32}));
+    fn->setAttr(
+        fir::getSymbolAttrName(),
+        mlir::StringAttr::get(builder.getContext(), mathOp.runtimeFunc));
+    fn->setAttr(fir::FIROpsDialect::getFirRuntimeAttrName(),
+                builder.getUnitAttr());
+  }
+
+  mlir::Value result = fir::AllocaOp::create(builder, loc, i256);
+  mlir::Value slot = fir::AllocaOp::create(builder, loc, i256);
+  fir::StoreOp::create(builder, loc, args[0], slot);
+  mlir::Value n = builder.createConvert(loc, i64, args[1]);
+  mlir::Value rnd = builder.createIntegerConstant(loc, i32, 0);
+  mlir::Value status =
+      fir::CallOp::create(builder, loc, fn,
+                          mlir::ValueRange{result, slot, n, rnd})
+          .getResult(0);
+  fir::runtime::genRaiseOctaStatus(builder, loc, status);
+  return fir::LoadOp::create(builder, loc, result);
+}
+
 // Generate a call into liboctamath for a COMPLEX(32) intrinsic.
 //
 // The same shape as genLibOctaCall, differing only in which type is passed by
@@ -1374,12 +1421,174 @@ static mlir::Value genOctaBin(fir::FirOpBuilder &builder, mlir::Location loc,
   return fir::LoadOp::create(builder, loc, result);
 }
 
+/// Emit a call to one of liboctamath's numeric-model entry points.
+///
+/// These are a different shape from genLibOctaCall and cannot share it. Fortran
+/// defines FRACTION, EXPONENT, SPACING, NEAREST, SCALE, AINT and ANINT on the
+/// model representation, so every one of them is exact: none takes a rounding
+/// mode, and passing one would put an argument the callee does not have on the
+/// stack. Two of them differ further - SCALE and NEAREST take a plain `int`
+/// beside the value, and EXPONENT returns one:
+///
+///     int octa_fraction(octa_t *r, const octa_t *x);
+///     int octa_scale   (octa_t *r, const octa_t *x, int i);
+///     int octa_exponent(int     *r, const octa_t *x);
+///
+/// The returned status is still raised. Exact does not mean flagless: SCALE
+/// can overflow, and IEEE requires inexact alongside overflow, which is a
+/// property liboctamath's own model suite asserts rather than assumes.
+static mlir::Value genOctaModel(fir::FirOpBuilder &builder, mlir::Location loc,
+                                llvm::StringRef name, mlir::Value x,
+                                mlir::Value intArg = {},
+                                bool resultIsInteger = false) {
+  mlir::Type i256 = builder.getIntegerType(256);
+  mlir::Type i32 = builder.getI32Type();
+  mlir::Type ref = fir::ReferenceType::get(i256);
+  mlir::Type resTy = resultIsInteger ? i32 : i256;
+  mlir::Type resRef = fir::ReferenceType::get(resTy);
+
+  llvm::SmallVector<mlir::Type> argTys{resRef, ref};
+  if (intArg)
+    argTys.push_back(i32);
+
+  mlir::func::FuncOp fn = builder.getNamedFunction(name);
+  if (!fn)
+    fn = builder.createFunction(loc, name,
+                                builder.getFunctionType(argTys, {i32}));
+
+  mlir::Value result = fir::AllocaOp::create(builder, loc, resTy);
+  mlir::Value slot = fir::AllocaOp::create(builder, loc, i256);
+  fir::StoreOp::create(builder, loc, x, slot);
+
+  llvm::SmallVector<mlir::Value> operands{result, slot};
+  if (intArg)
+    operands.push_back(builder.createConvert(loc, i32, intArg));
+
+  mlir::Value status =
+      fir::CallOp::create(builder, loc, fn, operands).getResult(0);
+  fir::runtime::genRaiseOctaStatus(builder, loc, status);
+  return fir::LoadOp::create(builder, loc, result);
+}
+
 /// A binary256 zero.
 static mlir::Value genOctaZero(fir::FirOpBuilder &builder, mlir::Location loc) {
   mlir::Type i256 = builder.getIntegerType(256);
   return mlir::arith::ConstantOp::create(
       builder, loc, i256, builder.getIntegerAttr(i256, llvm::APInt(256, 0)));
 }
+
+/// A binary256 one. 1.0 has the bias, 262143 = 0x3FFFF, in bits 62..44 and a
+/// zero fraction; the same constant appears in LowerHLFIRIntrinsics and
+/// ReductionProcessor for the same reason.
+static mlir::Value genOctaOne(fir::FirOpBuilder &builder, mlir::Location loc) {
+  mlir::Type i256 = builder.getIntegerType(256);
+  llvm::APInt bits(256, 0);
+  bits.insertBits(llvm::APInt(64, 0x3FFFF00000000000ULL), 192);
+  return mlir::arith::ConstantOp::create(builder, loc, i256,
+                                         builder.getIntegerAttr(i256, bits));
+}
+
+/// Emit `octa_cmp` on two REAL(32) values and return `a <pred> b`, false when
+/// the pair is unordered. The unordered flag is a separate output of the
+/// library precisely so that a NaN cannot be folded into the ordering code and
+/// silently compare as "less than".
+static mlir::Value genOctaCmp(fir::FirOpBuilder &builder, mlir::Location loc,
+                              mlir::Value a, mlir::Value b,
+                              mlir::arith::CmpIPredicate pred) {
+  mlir::Type i256 = builder.getIntegerType(256);
+  mlir::Type refI256 = fir::ReferenceType::get(i256);
+  mlir::Type i32 = builder.getI32Type();
+  mlir::Type refI32 = fir::ReferenceType::get(i32);
+
+  mlir::func::FuncOp fn = builder.getNamedFunction("octa_cmp");
+  if (!fn)
+    fn = builder.createFunction(
+        loc, "octa_cmp",
+        builder.getFunctionType({refI256, refI256, refI32}, {i32}));
+
+  mlir::Value aSlot = fir::AllocaOp::create(builder, loc, i256);
+  mlir::Value bSlot = fir::AllocaOp::create(builder, loc, i256);
+  mlir::Value unordSlot = fir::AllocaOp::create(builder, loc, i32);
+  fir::StoreOp::create(builder, loc, a, aSlot);
+  fir::StoreOp::create(builder, loc, b, bSlot);
+
+  auto call = fir::CallOp::create(builder, loc, fn,
+                                  mlir::ValueRange{aSlot, bSlot, unordSlot});
+  mlir::Value code = call.getResult(0);
+  mlir::Value unord = fir::LoadOp::create(builder, loc, unordSlot);
+  mlir::Value zero = builder.createIntegerConstant(loc, i32, 0);
+  mlir::Value isOrdered = mlir::arith::CmpIOp::create(
+      builder, loc, mlir::arith::CmpIPredicate::eq, unord, zero);
+  mlir::Value ordering =
+      mlir::arith::CmpIOp::create(builder, loc, pred, code, zero);
+  return mlir::arith::AndIOp::create(builder, loc, isOrdered, ordering);
+}
+
+/// FLOOR or CEILING of a REAL(32), as a REAL(32).
+///
+/// liboctamath has AINT, which truncates toward zero, and ANINT, which rounds
+/// half away from zero. Neither is a directed rounding, so these are built
+/// here rather than wired: truncation already answers for the half of the line
+/// where it points the right way, and the other half needs one step.
+///
+///   FLOOR(x)   = AINT(x) - (x < 0 and x is not integral)
+///   CEILING(x) = AINT(x) + (x > 0 and x is not integral)
+///
+/// The "not integral" test is what keeps FLOOR(-2.0) at -2 rather than -3, and
+/// it is a comparison against the truncated value rather than a fractional
+/// part, because a fractional part of a huge argument is zero for reasons that
+/// have nothing to do with the argument being integral.
+static mlir::Value genOctaDirectedAint(fir::FirOpBuilder &builder,
+                                       mlir::Location loc, mlir::Value x,
+                                       bool towardNegative) {
+  mlir::Value trunc = genOctaModel(builder, loc, "octa_aint", x);
+  mlir::Value zero = genOctaZero(builder, loc);
+  mlir::Value one = genOctaOne(builder, loc);
+
+  mlir::Value onWrongSide =
+      genOctaCmp(builder, loc, x, zero,
+                 towardNegative ? mlir::arith::CmpIPredicate::slt
+                                : mlir::arith::CmpIPredicate::sgt);
+  mlir::Value notIntegral =
+      genOctaCmp(builder, loc, trunc, x, mlir::arith::CmpIPredicate::ne);
+  mlir::Value adjust =
+      mlir::arith::AndIOp::create(builder, loc, onWrongSide, notIntegral);
+
+  mlir::Value stepped =
+      genOctaBin(builder, loc, towardNegative ? "octa_sub" : "octa_add", trunc,
+                 one);
+  return mlir::arith::SelectOp::create(builder, loc, adjust, stepped, trunc);
+}
+
+/// A REAL(32) converted to an integer of `resultType`, truncating toward zero.
+/// Callers that need a different rounding apply it to the real first, which is
+/// why this is only ever handed a value that is already integral.
+static mlir::Value genOctaToInt(fir::FirOpBuilder &builder, mlir::Location loc,
+                                mlir::Type resultType, mlir::Value x) {
+  // int octa_to_int64(long long *r, const octa_t *x) - the result travels by
+  // pointer and the return value is the IEEE status, which is raised: an
+  // out-of-range argument sets invalid rather than producing a plausible
+  // number.
+  mlir::Type i256 = builder.getIntegerType(256);
+  mlir::Type refI256 = fir::ReferenceType::get(i256);
+  mlir::Type i64 = builder.getIntegerType(64);
+  mlir::Type refI64 = fir::ReferenceType::get(i64);
+  mlir::Type i32 = builder.getI32Type();
+  mlir::func::FuncOp fn = builder.getNamedFunction("octa_to_int64");
+  if (!fn)
+    fn = builder.createFunction(
+        loc, "octa_to_int64", builder.getFunctionType({refI64, refI256}, {i32}));
+  mlir::Value out = fir::AllocaOp::create(builder, loc, i64);
+  mlir::Value slot = fir::AllocaOp::create(builder, loc, i256);
+  fir::StoreOp::create(builder, loc, x, slot);
+  mlir::Value status =
+      fir::CallOp::create(builder, loc, fn, mlir::ValueRange{out, slot})
+          .getResult(0);
+  fir::runtime::genRaiseOctaStatus(builder, loc, status);
+  return builder.createConvert(loc, resultType,
+                               fir::LoadOp::create(builder, loc, out));
+}
+
 
 /// NORM2 over a REAL(32) array, as a loop of octa_hypot.
 ///
@@ -1763,6 +1972,14 @@ static constexpr MathOperation mathOperations[] = {
     {"pow", "pow", genFuncType<Ty::Real<8>, Ty::Real<8>, Ty::Real<8>>,
      genMathOp<mlir::math::PowFOp>},
     {"pow", RTNAME_STRING(PowF128), FuncTypeReal16Real16Real16, genLibF128Call},
+    {"pow", "octa_pow", FuncTypeReal32Real32Real32, genLibOctaCall},
+    // An integer exponent is a different entry point, not a conversion of the
+    // exponent to REAL(32): pow of a negative base is undefined, and
+    // (-2.0_oct) ** 3 is not.
+    {"pow", "octa_powi",
+     genFuncType<Ty::Real<32>, Ty::Real<32>, Ty::Integer<4>>, genLibOctaPowI},
+    {"pow", "octa_powi",
+     genFuncType<Ty::Real<32>, Ty::Real<32>, Ty::Integer<8>>, genLibOctaPowI},
     {"pow", "cpowf",
      genFuncType<Ty::Complex<4>, Ty::Complex<4>, Ty::Complex<4>>,
      genMathOp<mlir::complex::PowOp>},
@@ -2977,6 +3194,8 @@ mlir::Value IntrinsicLibrary::genAint(mlir::Type resultType,
   assert(args.size() >= 1 && args.size() <= 2);
   // Skip optional kind argument to search the runtime; it is already reflected
   // in result type.
+  if (fir::isa_octuple_real(args[0].getType()))
+    return genOctaModel(builder, loc, "octa_aint", args[0]);
   return genRuntimeCall("aint", resultType, {args[0]});
 }
 
@@ -3038,6 +3257,8 @@ mlir::Value IntrinsicLibrary::genAnint(mlir::Type resultType,
   assert(args.size() >= 1 && args.size() <= 2);
   // Skip optional kind argument to search the runtime; it is already reflected
   // in result type.
+  if (fir::isa_octuple_real(args[0].getType()))
+    return genOctaModel(builder, loc, "octa_anint", args[0]);
   return genRuntimeCall("anint", resultType, {args[0]});
 }
 
@@ -3771,6 +3992,10 @@ mlir::Value IntrinsicLibrary::genCeiling(mlir::Type resultType,
   // Use ceil that is not an actual Fortran intrinsic but that is
   // an llvm intrinsic that does the same, but return a floating
   // point.
+  if (fir::isa_octuple_real(arg.getType()))
+    return genOctaToInt(builder, loc, resultType,
+                        genOctaDirectedAint(builder, loc, arg,
+                                            /*towardNegative=*/false));
   mlir::Value ceil = genRuntimeCall("ceil", arg.getType(), {arg});
   return builder.createConvert(loc, resultType, ceil);
 }
@@ -4382,6 +4607,16 @@ mlir::Value IntrinsicLibrary::genExponent(mlir::Type resultType,
                                           llvm::ArrayRef<mlir::Value> args) {
   assert(args.size() == 1);
 
+  // Fortran's EXPONENT is one more than the unbiased binary exponent, so
+  // EXPONENT(1.0) is 1. liboctamath returns that convention directly rather
+  // than IEEE's, which is the single likeliest defect in this family and is
+  // asserted by its own suite - shifting it by one reddens 34 of 115 checks.
+  if (fir::isa_octuple_real(args[0].getType()))
+    return builder.createConvert(
+        loc, resultType,
+        genOctaModel(builder, loc, "octa_exponent", args[0], {},
+                     /*resultIsInteger=*/true));
+
   return builder.createConvert(
       loc, resultType,
       fir::runtime::genExponent(builder, loc, resultType,
@@ -4504,6 +4739,10 @@ mlir::Value IntrinsicLibrary::genFloor(mlir::Type resultType,
   assert(args.size() >= 1);
   mlir::Value arg = args[0];
   // Use LLVM floor that returns real.
+  if (fir::isa_octuple_real(arg.getType()))
+    return genOctaToInt(builder, loc, resultType,
+                        genOctaDirectedAint(builder, loc, arg,
+                                            /*towardNegative=*/true));
   mlir::Value floor = genRuntimeCall("floor", arg.getType(), {arg});
   return builder.createConvert(loc, resultType, floor);
 }
@@ -4546,6 +4785,10 @@ void IntrinsicLibrary::genFlush(llvm::ArrayRef<fir::ExtendedValue> args) {
 mlir::Value IntrinsicLibrary::genFraction(mlir::Type resultType,
                                           llvm::ArrayRef<mlir::Value> args) {
   assert(args.size() == 1);
+
+  // Exact by definition: FRACTION only rewrites the exponent field, so it takes no rounding mode and there is no accuracy question to answer.
+  if (fir::isa_octuple_real(args[0].getType()))
+    return genOctaModel(builder, loc, "octa_fraction", args[0]);
 
   return builder.createConvert(
       loc, resultType,
@@ -7402,6 +7645,43 @@ mlir::Value IntrinsicLibrary::genNearest(mlir::Type resultType,
 
   assert(args.size() == 1 || args.size() == 2);
   mlir::Value x = args[0];
+  // REAL(32) reaches here as an opaque i256, so the dyn_cast below yields null
+  // and getWidth() dereferences it: this crashed the frontend with a
+  // segmentation fault and no diagnostic, which tells the user nothing and is
+  // indistinguishable from a compiler bug in unrelated code.
+  //
+  // NEAREST is the Fortran intrinsic and is implemented; the IEEE_NEXT_*
+  // module procedures share this generator but not this path, and refuse by
+  // name rather than falling into it.
+  if (fir::isa_octuple_real(x.getType())) {
+    if constexpr (proc != NearestProc::Nearest) {
+      TODO(loc, "IEEE_NEXT_AFTER/UP/DOWN for REAL(KIND=32)");
+    } else {
+      // octa_nearest takes the direction as a flag, not as a value: 1 steps
+      // toward +infinity. Fortran takes it from the sign of S, and requires S
+      // to be nonzero, so the sign bit is the whole question - including for
+      // a negative zero, whose sign bit is set.
+      mlir::Type i32 = builder.getI32Type();
+      mlir::Type i256 = builder.getIntegerType(256);
+      mlir::Type ref = fir::ReferenceType::get(i256);
+      mlir::func::FuncOp sb = builder.getNamedFunction("octa_signbit");
+      if (!sb)
+        sb = builder.createFunction(loc, "octa_signbit",
+                                    builder.getFunctionType({ref}, {i32}));
+      mlir::Value sSlot = fir::AllocaOp::create(builder, loc, i256);
+      fir::StoreOp::create(builder, loc, args[1], sSlot);
+      mlir::Value neg =
+          fir::CallOp::create(builder, loc, sb, mlir::ValueRange{sSlot})
+              .getResult(0);
+      mlir::Value zero = builder.createIntegerConstant(loc, i32, 0);
+      mlir::Value one = builder.createIntegerConstant(loc, i32, 1);
+      mlir::Value isNeg = mlir::arith::CmpIOp::create(
+          builder, loc, mlir::arith::CmpIPredicate::ne, neg, zero);
+      mlir::Value positive =
+          mlir::arith::SelectOp::create(builder, loc, isNeg, zero, one);
+      return genOctaModel(builder, loc, "octa_nearest", x, positive);
+    }
+  }
   mlir::FloatType xType = mlir::dyn_cast<mlir::FloatType>(x.getType());
   const unsigned xBitWidth = xType.getWidth();
   mlir::Type i1Ty = builder.getI1Type();
@@ -7559,6 +7839,12 @@ mlir::Value IntrinsicLibrary::genNint(mlir::Type resultType,
   assert(args.size() >= 1);
   // Skip optional kind argument to search the runtime; it is already reflected
   // in result type.
+  //
+  // NINT rounds half away from zero, which is what octa_anint does and what
+  // the arithmetic rounding mode would not: nearest-even would send 2.5 to 2.
+  if (fir::isa_octuple_real(args[0].getType()))
+    return genOctaToInt(builder, loc, resultType,
+                        genOctaModel(builder, loc, "octa_anint", args[0]));
   return genRuntimeCall("nint", resultType, {args[0]});
 }
 
@@ -8048,6 +8334,10 @@ mlir::Value IntrinsicLibrary::genRRSpacing(mlir::Type resultType,
                                            llvm::ArrayRef<mlir::Value> args) {
   assert(args.size() == 1);
 
+  // Unlike SPACING this is not clamped at TINY; the two differ there and a shared implementation would get one of them wrong.
+  if (fir::isa_octuple_real(args[0].getType()))
+    return genOctaModel(builder, loc, "octa_rrspacing", args[0]);
+
   return builder.createConvert(
       loc, resultType,
       fir::runtime::genRRSpacing(builder, loc, fir::getBase(args[0])));
@@ -8079,6 +8369,13 @@ IntrinsicLibrary::genSameTypeAs(mlir::Type resultType,
 mlir::Value IntrinsicLibrary::genScale(mlir::Type resultType,
                                        llvm::ArrayRef<mlir::Value> args) {
   assert(args.size() == 2);
+  // REAL(32) is an opaque i256, so the dyn_cast below yields null and the
+  // isF16() that follows it dereferences that null: this crashed the frontend
+  // with a segmentation fault and no diagnostic at all, which is a worse
+  // outcome than any wrong answer, because nothing points at the program that
+  // caused it.
+  if (fir::isa_octuple_real(resultType))
+    return genOctaModel(builder, loc, "octa_scale", args[0], args[1]);
   mlir::FloatType floatTy = mlir::dyn_cast<mlir::FloatType>(resultType);
   if (!floatTy.isF16() && !floatTy.isBF16()) // kind=4,8,10,16
     return builder.createConvert(
@@ -8942,6 +9239,10 @@ IntrinsicLibrary::genUcobound(mlir::Type resultType,
 mlir::Value IntrinsicLibrary::genSpacing(mlir::Type resultType,
                                          llvm::ArrayRef<mlir::Value> args) {
   assert(args.size() == 1);
+
+  // SPACING is clamped below at TINY, which was measured against gfortran rather than recalled - three probes returned TINY where the bare formula gives a subnormal. RRSPACING is not clamped.
+  if (fir::isa_octuple_real(args[0].getType()))
+    return genOctaModel(builder, loc, "octa_spacing", args[0]);
 
   return builder.createConvert(
       loc, resultType,

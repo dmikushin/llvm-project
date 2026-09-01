@@ -90,6 +90,16 @@ inline std::string mlirTypeToIntrinsicFortran(fir::FirOpBuilder &builder,
                                               mlir::Type type,
                                               mlir::Location loc,
                                               const llvm::Twine &name) {
+  // REAL(32) is carried as an opaque i256, so without this it falls past every
+  // integer width below and out of the bottom into a fatal "unsupported type
+  // in X: i256" - where the caller only wanted a name to put in a diagnostic.
+  // Every REAL(32) intrinsic that is not yet implemented reported itself that
+  // way, which names neither the kind nor the gap and reads like a defect in
+  // the type system rather than a missing implementation.
+  if (fir::isa_octuple_real(type))
+    return "REAL(KIND=32)";
+  if (fir::isa_octuple_complex(type))
+    return "COMPLEX(KIND=32)";
   if (auto floatTy = mlir::dyn_cast<mlir::FloatType>(type)) {
     if (std::optional<int> kind = mlirFloatTypeToKind(type))
       return "REAL(KIND="s + std::to_string(*kind) + ")";

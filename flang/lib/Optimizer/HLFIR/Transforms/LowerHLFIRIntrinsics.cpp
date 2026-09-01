@@ -340,6 +340,7 @@ protected:
   llvm::LogicalResult genOctaReduction(OP operation, llvm::StringRef opName,
                                        fir::FirOpBuilder &builder,
                                        mlir::Location loc, hlfir::Entity array,
+                                       mlir::Value mask,
                                        mlir::PatternRewriter &rewriter) const {
     constexpr bool isSum = std::is_same_v<OP, hlfir::SumOp>;
     constexpr bool isProduct = std::is_same_v<OP, hlfir::ProductOp>;
@@ -372,7 +373,29 @@ protected:
     if constexpr (isSum)
       inits.push_back(genOcta(loc, builder, 0, 0)); // correction
 
-    auto body = [&](mlir::Location l, fir::FirOpBuilder &b,
+    // A scalar mask does not vary with the element, so it is read once. The
+    // Entity is built only when there is a mask, because hlfir::Entity
+    // dereferences in its constructor and a null one crashes.
+    std::optional<hlfir::Entity> maskEntity;
+    mlir::Value scalarMask;
+    if (mask) {
+      maskEntity = hlfir::Entity{mask};
+      if (maskEntity->isScalar())
+        scalarMask = builder.createConvert(
+            loc, builder.getI1Type(),
+            hlfir::loadTrivialScalar(loc, builder, *maskEntity));
+    }
+
+    // With a mask, MAXVAL and MINVAL need to know whether anything was
+    // selected at all, which is not the same question as whether the array
+    // was empty: an array of a thousand elements with every one masked out
+    // must still give -HUGE. The flag is carried only when it is needed, so
+    // the unmasked loop is unchanged.
+    const bool needTaken = mask && !isSum && !isProduct;
+    if (needTaken)
+      inits.push_back(builder.createIntegerConstant(loc, builder.getI1Type(), 0));
+
+    auto step = [&](mlir::Location l, fir::FirOpBuilder &b,
                     mlir::ValueRange idx,
                     mlir::ValueRange acc) -> llvm::SmallVector<mlir::Value> {
       hlfir::Entity elem = hlfir::loadElementAt(l, b, array, idx);
@@ -410,6 +433,36 @@ protected:
       }
     };
 
+    // The mask is applied by selecting between the stepped accumulator and the
+    // one that came in, rather than by branching: every arm here is a handful
+    // of library calls, and control flow would have to be threaded through the
+    // reduction values by hand. A masked-out element therefore leaves every
+    // carried value exactly as it was, which is what "not present in the
+    // reduction" means for SUM's compensation term as much as for its sum.
+    auto body = [&](mlir::Location l, fir::FirOpBuilder &b,
+                    mlir::ValueRange idx,
+                    mlir::ValueRange acc) -> llvm::SmallVector<mlir::Value> {
+      if (!mask)
+        return step(l, b, idx, acc);
+
+      mlir::Value m = scalarMask;
+      if (!m) {
+        hlfir::Entity mElem = hlfir::loadElementAt(l, b, *maskEntity, idx);
+        m = b.createConvert(l, b.getI1Type(), mElem);
+      }
+
+      const unsigned carried = needTaken ? acc.size() - 1 : acc.size();
+      llvm::SmallVector<mlir::Value> in(acc.begin(), acc.begin() + carried);
+      llvm::SmallVector<mlir::Value> next = step(l, b, idx, in);
+      llvm::SmallVector<mlir::Value> out;
+      for (unsigned k = 0; k < carried; ++k)
+        out.push_back(mlir::arith::SelectOp::create(b, l, m, next[k], in[k]));
+      if (needTaken)
+        out.push_back(
+            mlir::arith::OrIOp::create(b, l, acc[carried], m));
+      return out;
+    };
+
     llvm::SmallVector<mlir::Value> result = hlfir::genLoopNestWithReductions(
         loc, builder, extents, inits, body, /*isUnordered=*/false);
     mlir::Value reduced = result[0];
@@ -426,6 +479,14 @@ protected:
           builder.createIntegerConstant(loc, builder.getIndexType(), 0);
       mlir::Value empty = mlir::arith::CmpIOp::create(
           builder, loc, mlir::arith::CmpIPredicate::eq, count, zeroIdx);
+      // With a mask the question is not whether the array was empty but
+      // whether anything was selected; an array whose every element is masked
+      // out must give the same answer as an empty one.
+      if (needTaken) {
+        mlir::Value one =
+            builder.createIntegerConstant(loc, builder.getI1Type(), 1);
+        empty = mlir::arith::XOrIOp::create(builder, loc, result.back(), one);
+      }
       mlir::Value huge =
           isMax ? genOcta(loc, builder, 0xFFFFEFFFFFFFFFFFULL, 1)
                 : genOcta(loc, builder, 0x7FFFEFFFFFFFFFFFULL, 1);
@@ -599,16 +660,27 @@ public:
     const mlir::Location &loc = operation->getLoc();
 
     // REAL(32) has no runtime kernel; the reduction is a loop of liboctamath
-    // calls, emitted here. Only total reductions without a MASK are covered -
-    // anything else falls through to the runtime path and fails there by name.
+    // calls, emitted here. Total reductions are covered, with or without a
+    // MASK. DIM is not: it makes the result an array of partial reductions,
+    // which this does not build, and it falls through to the runtime and
+    // fails there by name rather than quietly summing the wrong axis.
     if constexpr (std::is_same_v<OP, hlfir::SumOp> ||
                   std::is_same_v<OP, hlfir::ProductOp> ||
                   std::is_same_v<OP, hlfir::MaxvalOp> ||
                   std::is_same_v<OP, hlfir::MinvalOp>) {
       hlfir::Entity array{operation.getArray()};
       mlir::Type eleTy = hlfir::getFortranElementType(array.getType());
-      if (eleTy.isInteger(256) && !operation.getDim() && !operation.getMask())
-        return genOctaReduction(operation, opName, builder, loc, array,
+      mlir::Value mask = operation.getMask();
+      bool maskOk = true;
+      if (mask) {
+        hlfir::Entity m{mask};
+        // A box may be an absent optional and a polymorphic mask is not a
+        // plain LOGICAL; neither is handled, and neither is guessed at.
+        maskOk = !m.isBoxAddressOrValue() && !m.isPolymorphic() &&
+                 (m.isScalar() || m.getRank() == array.getRank());
+      }
+      if (eleTy.isInteger(256) && !operation.getDim() && maskOk)
+        return genOctaReduction(operation, opName, builder, loc, array, mask,
                                 rewriter);
     }
 
