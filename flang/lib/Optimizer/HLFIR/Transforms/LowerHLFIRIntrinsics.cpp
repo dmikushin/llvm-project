@@ -6,6 +6,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "flang/Optimizer/Builder/Complex.h"
 #include "flang/Optimizer/Builder/FIRBuilder.h"
 #include "flang/Optimizer/Builder/HLFIRTools.h"
 #include "flang/Optimizer/Builder/IntrinsicCall.h"
@@ -449,24 +450,50 @@ protected:
   /// for an empty array - zero, since the loop never runs - without a second
   /// reconciliation step, and it decides the NaN case: a NaN never compares
   /// better, so it is selected only when it is the first element and nothing
-  /// ordered ever displaces it.
+  /// ordered ever displaces it. The same seed gives the standard's answer for
+  /// an array every element of which is masked out: nothing is ever taken, so
+  /// every subscript stays zero.
+  ///
+  /// For rank n the accumulator carries n positions beside the value, and the
+  /// result is a rank-1 array of those n subscripts. "First occurrence" is in
+  /// array element order, which is what the loop nest already produces:
+  /// hlfir::genLoopNestWithReductions builds from the last extent outwards, so
+  /// the innermost loop drives the first subscript, and that is column-major.
   llvm::LogicalResult genOctaMinMaxLoc(OP operation, fir::FirOpBuilder &builder,
                                        mlir::Location loc, hlfir::Entity array,
+                                       mlir::Value mask,
                                        mlir::PatternRewriter &rewriter) const {
     constexpr bool isMin = std::is_same_v<OP, hlfir::MinlocOp>;
     llvm::SmallVector<mlir::Value> extents =
         hlfir::genExtentsVector(loc, builder, array);
+    const unsigned rank = extents.size();
 
     mlir::Type idxTy = builder.getIndexType();
+    mlir::Value zeroIdx = builder.createIntegerConstant(loc, idxTy, 0);
     llvm::SmallVector<mlir::Value> inits{
         isMin ? genOcta(loc, builder, 0x7FFFF00000000000ULL, 0)  // +infinity
-              : genOcta(loc, builder, 0xFFFFF00000000000ULL, 0), // -infinity
-        builder.createIntegerConstant(loc, idxTy, 0)};
+              : genOcta(loc, builder, 0xFFFFF00000000000ULL, 0)}; // -infinity
+    for (unsigned k = 0; k < rank; ++k)
+      inits.push_back(zeroIdx);
+
+    // A scalar mask does not vary with the element, so it is read once here
+    // rather than once per iteration. The Entity is built only when there is
+    // a mask: hlfir::Entity dereferences the value in its constructor, so
+    // wrapping a null one crashes rather than yielding something empty.
+    std::optional<hlfir::Entity> maskEntity;
+    mlir::Value scalarMask;
+    if (mask) {
+      maskEntity = hlfir::Entity{mask};
+      if (maskEntity->isScalar())
+        scalarMask = builder.createConvert(
+            loc, builder.getI1Type(),
+            hlfir::loadTrivialScalar(loc, builder, *maskEntity));
+    }
 
     auto body = [&](mlir::Location l, fir::FirOpBuilder &b, mlir::ValueRange i,
                     mlir::ValueRange acc) -> llvm::SmallVector<mlir::Value> {
       hlfir::Entity elem = hlfir::loadElementAt(l, b, array, i);
-      mlir::Value best = acc[0], bestPos = acc[1];
+      mlir::Value best = acc[0];
       mlir::Value unordered;
       mlir::Value code = genOctaCmp(l, b, elem, best, &unordered);
       mlir::Value zeroI32 = b.createIntegerConstant(l, b.getI32Type(), 0);
@@ -481,36 +508,65 @@ protected:
       mlir::Value ordered = mlir::arith::CmpIOp::create(
           b, l, mlir::arith::CmpIPredicate::eq, unordered, zeroI32);
       better = mlir::arith::AndIOp::create(b, l, better, ordered);
-      mlir::Value zeroIdx = b.createIntegerConstant(l, b.getIndexType(), 0);
+      mlir::Value zIdx = b.createIntegerConstant(l, b.getIndexType(), 0);
       mlir::Value nothingYet = mlir::arith::CmpIOp::create(
-          b, l, mlir::arith::CmpIPredicate::eq, bestPos, zeroIdx);
+          b, l, mlir::arith::CmpIPredicate::eq, acc[1], zIdx);
       mlir::Value take = mlir::arith::OrIOp::create(b, l, better, nothingYet);
-      return {mlir::arith::SelectOp::create(b, l, take, elem, best),
-              mlir::arith::SelectOp::create(b, l, take, i[0], bestPos)};
+      // The mask gates the whole decision, including the "nothing yet" arm:
+      // a masked-out element must not be taken merely because it came first,
+      // which is the difference between MINLOC over the selected elements and
+      // MINLOC over the array.
+      if (mlir::Value m = scalarMask) {
+        take = mlir::arith::AndIOp::create(b, l, take, m);
+      } else if (mask) {
+        hlfir::Entity mElem = hlfir::loadElementAt(l, b, *maskEntity, i);
+        mlir::Value mBit = b.createConvert(l, b.getI1Type(), mElem);
+        take = mlir::arith::AndIOp::create(b, l, take, mBit);
+      }
+      llvm::SmallVector<mlir::Value> next;
+      next.push_back(mlir::arith::SelectOp::create(b, l, take, elem, best));
+      for (unsigned k = 0; k < rank; ++k)
+        next.push_back(
+            mlir::arith::SelectOp::create(b, l, take, i[k], acc[k + 1]));
+      return next;
     };
 
-    mlir::Value pos = hlfir::genLoopNestWithReductions(
-        loc, builder, extents, inits, body, /*isUnordered=*/false)[1];
+    llvm::SmallVector<mlir::Value> reduced = hlfir::genLoopNestWithReductions(
+        loc, builder, extents, inits, body, /*isUnordered=*/false);
 
     mlir::Type resultEleTy = hlfir::getFortranElementType(operation.getType());
-    mlir::Value scalar = builder.createConvert(loc, resultEleTy, pos);
+    llvm::SmallVector<mlir::Value> positions;
+    for (unsigned k = 0; k < rank; ++k)
+      positions.push_back(
+          builder.createConvert(loc, resultEleTy, reduced[k + 1]));
 
-    // With DIM the result of a rank-1 reduction is a scalar; without it, the
-    // standard gives a rank-1 array of one element, since its length is the
-    // rank of the argument.
+    // With DIM on a rank-1 array the result is a scalar; otherwise it is a
+    // rank-1 array whose length is the rank of the argument.
     if (mlir::isa<hlfir::ExprType>(operation.getType())) {
-      mlir::Value one = builder.createIntegerConstant(loc, idxTy, 1);
-      mlir::Value shape = builder.genShape(loc, {one});
+      mlir::Value n = builder.createIntegerConstant(loc, idxTy, rank);
+      mlir::Value shape = builder.genShape(loc, {n});
       hlfir::ElementalOp elemental = hlfir::genElementalOp(
           loc, builder, resultEleTy, shape, /*typeParams=*/{},
-          [&](mlir::Location l, fir::FirOpBuilder &, mlir::ValueRange) {
-            return hlfir::Entity{scalar};
+          [&](mlir::Location l, fir::FirOpBuilder &b,
+              mlir::ValueRange idx) -> hlfir::Entity {
+            // A select chain rather than a temporary array: the rank is a
+            // compile-time constant and at most 15, and this keeps the result
+            // an SSA value.
+            mlir::Value res = positions[rank - 1];
+            for (unsigned k = rank - 1; k-- > 0;) {
+              mlir::Value want =
+                  b.createIntegerConstant(l, idx[0].getType(), k + 1);
+              mlir::Value is = mlir::arith::CmpIOp::create(
+                  b, l, mlir::arith::CmpIPredicate::eq, idx[0], want);
+              res = mlir::arith::SelectOp::create(b, l, is, positions[k], res);
+            }
+            return hlfir::Entity{res};
           },
           /*isUnordered=*/true, /*polymorphicMold=*/{}, operation.getType());
       rewriter.replaceOp(operation, elemental.getResult());
       return mlir::success();
     }
-    rewriter.replaceOp(operation, scalar);
+    rewriter.replaceOp(operation, positions[0]);
     return mlir::success();
   }
 
@@ -556,23 +612,36 @@ public:
                                 rewriter);
     }
 
-    // MINLOC/MAXLOC over REAL(32), rank 1 only. A rank-1 reduction is total
-    // whether or not DIM is written, so DIM=1 is accepted and only changes
-    // whether the result is a scalar; any other DIM is a partial reduction
-    // over a higher rank and still goes to the runtime, where it fails by
-    // name rather than being answered approximately here.
+    // MINLOC/MAXLOC over REAL(32), any rank, with or without MASK. DIM is
+    // accepted only when the argument is rank 1 and DIM is the constant 1,
+    // where it is a total reduction and only changes whether the result is a
+    // scalar. Any other DIM is a partial reduction whose result is an array of
+    // locations, which this does not build; it goes to the runtime and fails
+    // there by name.
+    //
+    // An optional MASK is refused here rather than dereferenced: it may be
+    // absent at run time, and the test for that is machinery this lowering
+    // does not carry. It too reaches the runtime and fails by name.
     if constexpr (std::is_same_v<OP, hlfir::MinlocOp> ||
                   std::is_same_v<OP, hlfir::MaxlocOp>) {
       hlfir::Entity array{operation.getArray()};
       mlir::Type eleTy = hlfir::getFortranElementType(array.getType());
-      bool dimIsOne = !operation.getDim();
+      bool dimOk = !operation.getDim();
       if (mlir::Value dim = operation.getDim()) {
         if (std::optional<llvm::APInt> c = fir::getIntIfConstant(dim))
-          dimIsOne = c->getSExtValue() == 1;
+          dimOk = c->getSExtValue() == 1 && array.getRank() == 1;
       }
-      if (eleTy.isInteger(256) && array.getRank() == 1 && dimIsOne &&
-          !operation.getMask())
-        return genOctaMinMaxLoc(operation, builder, loc, array, rewriter);
+      mlir::Value mask = operation.getMask();
+      bool maskOk = true;
+      if (mask) {
+        hlfir::Entity m{mask};
+        // A box may be an absent optional; a polymorphic mask is not a plain
+        // LOGICAL. Neither is handled, and neither is guessed at.
+        maskOk = !m.isBoxAddressOrValue() && !m.isPolymorphic() &&
+                 (m.isScalar() || m.getRank() == array.getRank());
+      }
+      if (eleTy.isInteger(256) && dimOk && maskOk)
+        return genOctaMinMaxLoc(operation, builder, loc, array, mask, rewriter);
     }
 
     mlir::Type i32 = builder.getI32Type();
@@ -845,6 +914,78 @@ struct DotProductOpConversion
                                             /*isUnordered=*/false)[0];
   }
 
+  /// DOT_PRODUCT over COMPLEX(KIND=32).
+  ///
+  /// The standard conjugates the first argument, so the term is
+  /// conj(a) * c = (a_re*c_re + a_im*c_im) + (a_re*c_im - a_im*c_re) i.
+  /// The conjugation is therefore in the signs above rather than in a separate
+  /// negation, and it is the whole difference between this and the unconjugated
+  /// product: getting it wrong yields a perfectly plausible complex number,
+  /// which is why it was left out until there was a test whose two candidate
+  /// answers differ.
+  ///
+  /// Each part is accumulated with its own compensation, for the same reason
+  /// the real case compensates: flang-rt does so for every other kind, and the
+  /// error Kahan repairs grows with the term count, not the format width.
+  mlir::Value genOctaComplexDotProduct(fir::FirOpBuilder &builder,
+                                       mlir::Location loc, hlfir::Entity lhs,
+                                       hlfir::Entity rhs,
+                                       mlir::Type resultTy) const {
+    llvm::SmallVector<mlir::Value> extents =
+        hlfir::genExtentsVector(loc, builder, lhs);
+    mlir::Value zero = genOcta(loc, builder, 0, 0);
+    // sum_re, corr_re, sum_im, corr_im
+    llvm::SmallVector<mlir::Value> inits{zero, zero, zero, zero};
+
+    // One compensated addition: returns the new sum and the new correction.
+    auto kahan = [](mlir::Location l, fir::FirOpBuilder &b, mlir::Value sum,
+                    mlir::Value corr,
+                    mlir::Value term) -> std::pair<mlir::Value, mlir::Value> {
+      mlir::Value next = genOctaBinary(l, b, "octa_sub", term, corr);
+      mlir::Value sumIfNan = genOctaBinary(l, b, "octa_add", sum, term);
+      mlir::Value sumOk = genOctaBinary(l, b, "octa_add", sum, next);
+      mlir::Value diff = genOctaBinary(l, b, "octa_sub", sumOk, sum);
+      mlir::Value corrOk = genOctaBinary(l, b, "octa_sub", diff, next);
+      mlir::Value unordered;
+      (void)genOctaCmp(l, b, next, next, &unordered);
+      mlir::Value zeroI32 = b.createIntegerConstant(l, b.getI32Type(), 0);
+      mlir::Value isNan = mlir::arith::CmpIOp::create(
+          b, l, mlir::arith::CmpIPredicate::ne, unordered, zeroI32);
+      mlir::Value z = genOcta(l, b, 0, 0);
+      return {mlir::arith::SelectOp::create(b, l, isNan, sumIfNan, sumOk),
+              mlir::arith::SelectOp::create(b, l, isNan, z, corrOk)};
+    };
+
+    auto body = [&](mlir::Location l, fir::FirOpBuilder &b, mlir::ValueRange idx,
+                    mlir::ValueRange acc) -> llvm::SmallVector<mlir::Value> {
+      hlfir::Entity a = hlfir::loadElementAt(l, b, lhs, idx);
+      hlfir::Entity c = hlfir::loadElementAt(l, b, rhs, idx);
+      fir::factory::Complex cx{b, l};
+      mlir::Value aRe = cx.extractComplexPart(a, /*isImagPart=*/false);
+      mlir::Value aIm = cx.extractComplexPart(a, /*isImagPart=*/true);
+      mlir::Value cRe = cx.extractComplexPart(c, /*isImagPart=*/false);
+      mlir::Value cIm = cx.extractComplexPart(c, /*isImagPart=*/true);
+
+      mlir::Value reRe = genOctaBinary(l, b, "octa_mul", aRe, cRe);
+      mlir::Value imIm = genOctaBinary(l, b, "octa_mul", aIm, cIm);
+      mlir::Value reIm = genOctaBinary(l, b, "octa_mul", aRe, cIm);
+      mlir::Value imRe = genOctaBinary(l, b, "octa_mul", aIm, cRe);
+      // conj(a)*c: the imaginary parts add in the real term and subtract in
+      // the imaginary one. Reversing either sign is the silent error.
+      mlir::Value termRe = genOctaBinary(l, b, "octa_add", reRe, imIm);
+      mlir::Value termIm = genOctaBinary(l, b, "octa_sub", reIm, imRe);
+
+      auto [sumRe, corrRe] = kahan(l, b, acc[0], acc[1], termRe);
+      auto [sumIm, corrIm] = kahan(l, b, acc[2], acc[3], termIm);
+      return {sumRe, corrRe, sumIm, corrIm};
+    };
+
+    llvm::SmallVector<mlir::Value> reduced = hlfir::genLoopNestWithReductions(
+        loc, builder, extents, inits, body, /*isUnordered=*/false);
+    return fir::factory::Complex{builder, loc}.createComplex(
+        resultTy, reduced[0], reduced[2]);
+  }
+
   llvm::LogicalResult
   matchAndRewrite(hlfir::DotProductOp dotProduct,
                   mlir::PatternRewriter &rewriter) const override {
@@ -854,13 +995,18 @@ struct DotProductOpConversion
     mlir::Value lhs = dotProduct.getLhs();
     mlir::Value rhs = dotProduct.getRhs();
 
-    // REAL(32) has no runtime kernel. COMPLEX(KIND=32) is deliberately not
-    // handled here: DOT_PRODUCT conjugates its first argument for complex
-    // operands, and getting that wrong is a silent sign error rather than a
-    // failure. It still reaches the runtime and still fails there by name.
-    if (hlfir::getFortranElementType(dotProduct.getType()).isInteger(256)) {
+    // REAL(32) and COMPLEX(KIND=32) have no runtime kernel.
+    mlir::Type resultTy = dotProduct.getType();
+    if (hlfir::getFortranElementType(resultTy).isInteger(256)) {
       mlir::Value result = genOctaDotProduct(builder, loc, hlfir::Entity{lhs},
                                              hlfir::Entity{rhs});
+      rewriter.replaceOp(dotProduct, result);
+      return mlir::success();
+    }
+    if (fir::isa_octuple_complex(hlfir::getFortranElementType(resultTy))) {
+      mlir::Value result = genOctaComplexDotProduct(
+          builder, loc, hlfir::Entity{lhs}, hlfir::Entity{rhs},
+          hlfir::getFortranElementType(resultTy));
       rewriter.replaceOp(dotProduct, result);
       return mlir::success();
     }

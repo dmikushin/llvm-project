@@ -133,6 +133,18 @@ def IsFortranNumericalOrLogicalArrayObjectPred
 def AnyFortranNumericalOrLogicalArrayObject : Type<IsFortranNumericalOrLogicalArrayObjectPred,
     "any array-like object containing a numerical or logical type">;
 
+// DOT_PRODUCT additionally accepts COMPLEX(KIND=32), which is complex<i256>
+// and so is not "numerical" by fir::isa_complex. It is named here rather than
+// added to the general predicate because only dot_product lowers it; sum,
+// product, matmul and matmul_transpose share that predicate and do not.
+def IsFortranOctupleComplexArrayObjectPred
+        : CPred<"::hlfir::isFortranOctupleComplexArrayObject($_self)">;
+def AnyFortranDotProductOperand
+        : Type<Or<[IsFortranNumericalOrLogicalArrayObjectPred,
+                   IsFortranOctupleComplexArrayObjectPred]>,
+               "any array-like object containing a numerical or logical type, "
+               "or COMPLEX(KIND=32)">;
+
 def IsFortranArrayObjectPred
         : CPred<"::hlfir::isFortranArrayObject($_self)">;
 def AnyFortranArrayObject : Type<IsFortranArrayObjectPred,

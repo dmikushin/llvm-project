@@ -140,6 +140,23 @@ bool hlfir::isFortranNumericalOrLogicalArrayObject(mlir::Type type) {
   return false;
 }
 
+/// COMPLEX(KIND=32) is complex<i256>, which fir::isa_complex rejects because
+/// its element is not a float - see the comment on fir::isa_octuple_complex.
+/// It is named separately here, rather than admitted to
+/// isFortranScalarNumericalType, so that it reaches only the operations that
+/// have a lowering for it. Widening the general predicate would let it into
+/// hlfir.sum, hlfir.product, hlfir.matmul and hlfir.matmul_transpose as well,
+/// none of which lower it; those would then stop failing at verification and
+/// start failing in the runtime instead, which is a worse place to find out.
+bool hlfir::isFortranOctupleComplexArrayObject(mlir::Type type) {
+  if (isBoxAddressType(type))
+    return false;
+  if (auto arrayTy = mlir::dyn_cast<fir::SequenceType>(
+          getFortranElementOrSequenceType(type)))
+    return fir::isa_octuple_complex(arrayTy.getEleTy());
+  return false;
+}
+
 bool hlfir::isFortranArrayObject(mlir::Type type) {
   if (isBoxAddressType(type))
     return false;

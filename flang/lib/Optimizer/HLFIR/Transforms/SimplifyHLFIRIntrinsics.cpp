@@ -3056,9 +3056,16 @@ public:
     // measured consequence, as the reduction converters above: without this,
     // DOT_PRODUCT would answer differently at -O0 and -O2. The loop of
     // liboctamath calls is emitted in LowerHLFIRIntrinsics, which always runs.
-    if (product.getType().isInteger(256))
+    //
+    // COMPLEX(KIND=32) is complex<i256> and needs the same refusal for a
+    // different reason: this converter asks the kind map for the element type,
+    // and defaultRealKind answers kind 32 with a fatal error rather than a
+    // plausible width. Measured: without this line, a COMPLEX(32)
+    // DOT_PRODUCT compiles at -O0 and aborts the compiler at -O1 and above.
+    if (product.getType().isInteger(256) ||
+        fir::isa_octuple_complex(product.getType()))
       return rewriter.notifyMatchFailure(
-          product, "REAL(32) is an opaque i256; arith cannot multiply it");
+          product, "REAL(32)/COMPLEX(32) is opaque; arith cannot multiply it");
 
     mlir::Location loc = product.getLoc();
     fir::FirOpBuilder builder{rewriter, product.getOperation()};

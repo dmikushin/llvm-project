@@ -133,6 +133,7 @@ inline bool isFortranEntity(mlir::Value value) {
 bool isFortranScalarNumericalType(mlir::Type);
 bool isFortranNumericalArrayObject(mlir::Type);
 bool isFortranNumericalOrLogicalArrayObject(mlir::Type);
+bool isFortranOctupleComplexArrayObject(mlir::Type);
 bool isFortranArrayObject(mlir::Type);
 bool isFortranLogicalArrayObject(mlir::Type);
 bool isPassByRefOrIntegerType(mlir::Type);

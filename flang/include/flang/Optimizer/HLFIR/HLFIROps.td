@@ -704,8 +704,8 @@ def hlfir_DotProductOp : hlfir_Op<"dot_product",
   }];
 
   let arguments = (ins
-    AnyFortranNumericalOrLogicalArrayObject:$lhs,
-    AnyFortranNumericalOrLogicalArrayObject:$rhs,
+    AnyFortranDotProductOperand:$lhs,
+    AnyFortranDotProductOperand:$rhs,
     DefaultValuedAttr<Arith_FastMathAttr,
                       "::mlir::arith::FastMathFlags::none">:$fastmath
   );

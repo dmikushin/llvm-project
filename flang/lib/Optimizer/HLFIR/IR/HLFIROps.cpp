@@ -1270,7 +1270,11 @@ llvm::LogicalResult hlfir::DotProductOp::verify() {
                          "argument types are logical");
   }
 
+  // COMPLEX(KIND=32) is complex<i256>, which isFortranScalarNumericalType does
+  // not admit; it is accepted here for the same reason the operands are, and
+  // only here. See AnyFortranDotProductOperand in HLFIROpBase.td.
   if (!hlfir::isFortranScalarNumericalType(resultTy) &&
+      !fir::isa_octuple_complex(resultTy) &&
       !mlir::isa<fir::LogicalType>(resultTy))
     return emitOpError(
         "the result must be of scalar numerical or logical type");
