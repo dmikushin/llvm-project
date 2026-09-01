@@ -1316,6 +1316,52 @@ static mlir::Value genLibOctaPowI(fir::FirOpBuilder &builder,
   return fir::LoadOp::create(builder, loc, result);
 }
 
+// BESSEL_JN(N, X) and BESSEL_YN(N, X), whose order is an integer.
+//
+//     int octa_jn(octa_t *r, int n, const octa_t *x, octa_rnd_t rnd);
+//
+// Not genLibOctaCall with an extra argument: the order comes *before* the
+// value in the C signature, and it is passed by value while everything else
+// here is passed by reference. Fortran's argument order is the same - N then X
+// - so args[0] is the order, but that coincidence is worth stating rather than
+// relying on, because the two orders are independent and only one of them is
+// visible from this file.
+static mlir::Value genLibOctaBesselN(fir::FirOpBuilder &builder,
+                                     mlir::Location loc,
+                                     const MathOperation &mathOp,
+                                     mlir::FunctionType libFuncType,
+                                     llvm::ArrayRef<mlir::Value> args) {
+  (void)libFuncType;
+  assert(args.size() == 2);
+  mlir::Type i256 = builder.getIntegerType(256);
+  mlir::Type ref = fir::ReferenceType::get(i256);
+  mlir::Type i32 = builder.getI32Type();
+
+  mlir::func::FuncOp fn = builder.getNamedFunction(mathOp.runtimeFunc);
+  if (!fn) {
+    fn = builder.createFunction(
+        loc, mathOp.runtimeFunc,
+        builder.getFunctionType({ref, i32, ref, i32}, {i32}));
+    fn->setAttr(
+        fir::getSymbolAttrName(),
+        mlir::StringAttr::get(builder.getContext(), mathOp.runtimeFunc));
+    fn->setAttr(fir::FIROpsDialect::getFirRuntimeAttrName(),
+                builder.getUnitAttr());
+  }
+
+  mlir::Value result = fir::AllocaOp::create(builder, loc, i256);
+  mlir::Value slot = fir::AllocaOp::create(builder, loc, i256);
+  fir::StoreOp::create(builder, loc, args[1], slot);
+  mlir::Value n = builder.createConvert(loc, i32, args[0]);
+  mlir::Value rnd = builder.createIntegerConstant(loc, i32, 0);
+  mlir::Value status =
+      fir::CallOp::create(builder, loc, fn,
+                          mlir::ValueRange{result, n, slot, rnd})
+          .getResult(0);
+  fir::runtime::genRaiseOctaStatus(builder, loc, status);
+  return fir::LoadOp::create(builder, loc, result);
+}
+
 // Generate a call into liboctamath for a COMPLEX(32) intrinsic.
 //
 // The same shape as genLibOctaCall, differing only in which type is passed by
@@ -1380,6 +1426,65 @@ static mlir::Value genLibOctaComplexCall(fir::FirOpBuilder &builder,
                                    /*resultIsReal=*/false);
 }
 
+// `z ** n` on a COMPLEX(32) base with an INTEGER exponent.
+//
+// Every other kind has a dedicated entry point for this - cpowi, cqpowi -
+// which multiplies repeatedly. liboctamath has no octa_cpowi, and adding
+// arithmetic to the library is not this change, so the exponent is widened to
+// a COMPLEX(32) and octa_cpow does the work.
+//
+// That is not the same function, and the difference is worth stating because
+// it is invisible in every ordinary case. octa_cpow evaluates exp(w log z), so
+// for a base on the negative real axis - where the true answer has an exactly
+// zero imaginary part - it returns a tiny non-zero one instead, sin(n*pi)
+// being zero only in exact arithmetic. Values off that axis are unaffected and
+// correctly rounded. A repeated-multiplication path would keep the exact zero
+// and pay a rounding per multiply instead; neither is free, and this one is
+// the one that does not require new mathematics.
+static mlir::Value genLibOctaCPowI(fir::FirOpBuilder &builder,
+                                   mlir::Location loc,
+                                   const MathOperation &mathOp,
+                                   mlir::FunctionType libFuncType,
+                                   llvm::ArrayRef<mlir::Value> args) {
+  (void)libFuncType;
+  assert(args.size() == 2);
+  mlir::Type i256 = builder.getIntegerType(256);
+  mlir::Type cplxTy = mlir::ComplexType::get(i256);
+
+  // Widen the integer to a REAL(32) through the library, then place it as the
+  // real part of the exponent. octa_from_int64 is exact for every value an
+  // INTEGER(8) can hold, so no rounding enters here.
+  mlir::Type i64 = builder.getIntegerType(64);
+  mlir::Type ref = fir::ReferenceType::get(i256);
+  mlir::func::FuncOp conv = builder.getNamedFunction("octa_from_int64");
+  if (!conv) {
+    conv = builder.createFunction(loc, "octa_from_int64",
+                                  builder.getFunctionType({ref, i64}, {}));
+    conv->setAttr(fir::getSymbolAttrName(),
+                  mlir::StringAttr::get(builder.getContext(),
+                                        "octa_from_int64"));
+    conv->setAttr(fir::FIROpsDialect::getFirRuntimeAttrName(),
+                  builder.getUnitAttr());
+  }
+  mlir::Value nSlot = fir::AllocaOp::create(builder, loc, i256);
+  fir::CallOp::create(
+      builder, loc, conv,
+      mlir::ValueRange{nSlot, builder.createConvert(loc, i64, args[1])});
+  mlir::Value nReal = fir::LoadOp::create(builder, loc, nSlot);
+
+  mlir::Value zero = builder.createIntegerConstant(loc, i256, 0);
+  mlir::Value expo = fir::UndefOp::create(builder, loc, cplxTy);
+  expo = fir::InsertValueOp::create(
+      builder, loc, cplxTy, expo, nReal,
+      builder.getArrayAttr(builder.getIntegerAttr(builder.getIndexType(), 0)));
+  expo = fir::InsertValueOp::create(
+      builder, loc, cplxTy, expo, zero,
+      builder.getArrayAttr(builder.getIntegerAttr(builder.getIndexType(), 1)));
+
+  return genLibOctaComplexCallImpl(builder, loc, mathOp.runtimeFunc,
+                                   {args[0], expo}, /*resultIsReal=*/false);
+}
+
 static mlir::Value genLibOctaCabsCall(fir::FirOpBuilder &builder,
                                       mlir::Location loc,
                                       const MathOperation &mathOp,
@@ -1388,6 +1493,34 @@ static mlir::Value genLibOctaCabsCall(fir::FirOpBuilder &builder,
   (void)libFuncType;
   return genLibOctaComplexCallImpl(builder, loc, mathOp.runtimeFunc, args,
                                    /*resultIsReal=*/true);
+}
+
+/// Emit `int octa_<name>(octa_t *r, const octa_t *a, int rnd)` on one loaded
+/// binary256 value and return the loaded result.
+///
+/// Reachable without a MathOperation row, for intrinsics that flang routes
+/// through an IntrinsicLibrary method instead of the elementwise table. Unlike
+/// genOctaModel this passes a rounding mode, because these functions round -
+/// they are not defined on the model representation.
+static mlir::Value genOctaUnary(fir::FirOpBuilder &builder, mlir::Location loc,
+                                llvm::StringRef name, mlir::Value x) {
+  mlir::Type i256 = builder.getIntegerType(256);
+  mlir::Type ref = fir::ReferenceType::get(i256);
+  mlir::Type i32 = builder.getI32Type();
+  mlir::func::FuncOp fn = builder.getNamedFunction(name);
+  if (!fn)
+    fn = builder.createFunction(
+        loc, name, builder.getFunctionType({ref, ref, i32}, {i32}));
+  mlir::Value result = fir::AllocaOp::create(builder, loc, i256);
+  mlir::Value slot = fir::AllocaOp::create(builder, loc, i256);
+  fir::StoreOp::create(builder, loc, x, slot);
+  mlir::Value rnd = builder.createIntegerConstant(loc, i32, 0);
+  mlir::Value status =
+      fir::CallOp::create(builder, loc, fn,
+                          mlir::ValueRange{result, slot, rnd})
+          .getResult(0);
+  fir::runtime::genRaiseOctaStatus(builder, loc, status);
+  return fir::LoadOp::create(builder, loc, result);
 }
 
 /// Emit `int octa_<name>(octa_t *r, const octa_t *a, const octa_t *b, int)`
@@ -1659,6 +1792,10 @@ constexpr auto FuncTypeReal32Complex32 =
     genFuncType<Ty::Real<32>, Ty::Complex<32>>;
 constexpr auto FuncTypeComplex32Complex32 =
     genFuncType<Ty::Complex<32>, Ty::Complex<32>>;
+constexpr auto FuncTypeReal32Integer4Real32 =
+    genFuncType<Ty::Real<32>, Ty::Integer<4>, Ty::Real<32>>;
+constexpr auto FuncTypeComplex32Complex32Complex32 =
+    genFuncType<Ty::Complex<32>, Ty::Complex<32>, Ty::Complex<32>>;
 
 static constexpr MathOperation mathOperations[] = {
     {"abs", "fabsf", genFuncType<Ty::Real<4>, Ty::Real<4>>,
@@ -1687,6 +1824,7 @@ static constexpr MathOperation mathOperations[] = {
     {"acosh", "acosh", genFuncType<Ty::Real<8>, Ty::Real<8>>,
      genMathOp<mlir::math::AcoshOp>},
     {"acosh", RTNAME_STRING(AcoshF128), FuncTypeReal16Real16, genLibF128Call},
+    {"acosh", "octa_acosh", FuncTypeReal32Real32, genLibOctaCall},
     {"acosh", "cacoshf", genFuncType<Ty::Complex<4>, Ty::Complex<4>>,
      genLibCall},
     {"acosh", "cacosh", genFuncType<Ty::Complex<8>, Ty::Complex<8>>,
@@ -1723,6 +1861,7 @@ static constexpr MathOperation mathOperations[] = {
     {"asinh", "asinh", genFuncType<Ty::Real<8>, Ty::Real<8>>,
      genMathOp<mlir::math::AsinhOp>},
     {"asinh", RTNAME_STRING(AsinhF128), FuncTypeReal16Real16, genLibF128Call},
+    {"asinh", "octa_asinh", FuncTypeReal32Real32, genLibOctaCall},
     {"asinh", "casinhf", genFuncType<Ty::Complex<4>, Ty::Complex<4>>,
      genLibCall},
     {"asinh", "casinh", genFuncType<Ty::Complex<8>, Ty::Complex<8>>,
@@ -1758,6 +1897,7 @@ static constexpr MathOperation mathOperations[] = {
     {"atanh", "atanh", genFuncType<Ty::Real<8>, Ty::Real<8>>,
      genMathOp<mlir::math::AtanhOp>},
     {"atanh", RTNAME_STRING(AtanhF128), FuncTypeReal16Real16, genLibF128Call},
+    {"atanh", "octa_atanh", FuncTypeReal32Real32, genLibOctaCall},
     {"atanh", "catanhf", genFuncType<Ty::Complex<4>, Ty::Complex<4>>,
      genLibCall},
     {"atanh", "catanh", genFuncType<Ty::Complex<8>, Ty::Complex<8>>,
@@ -1767,27 +1907,35 @@ static constexpr MathOperation mathOperations[] = {
     {"bessel_j0", "j0f", genFuncType<Ty::Real<4>, Ty::Real<4>>, genLibCall},
     {"bessel_j0", "j0", genFuncType<Ty::Real<8>, Ty::Real<8>>, genLibCall},
     {"bessel_j0", RTNAME_STRING(J0F128), FuncTypeReal16Real16, genLibF128Call},
+    {"bessel_j0", "octa_j0", FuncTypeReal32Real32, genLibOctaCall},
     {"bessel_j1", "j1f", genFuncType<Ty::Real<4>, Ty::Real<4>>, genLibCall},
     {"bessel_j1", "j1", genFuncType<Ty::Real<8>, Ty::Real<8>>, genLibCall},
     {"bessel_j1", RTNAME_STRING(J1F128), FuncTypeReal16Real16, genLibF128Call},
+    {"bessel_j1", "octa_j1", FuncTypeReal32Real32, genLibOctaCall},
     {"bessel_jn", "jnf", genFuncType<Ty::Real<4>, Ty::Integer<4>, Ty::Real<4>>,
      genLibCall},
     {"bessel_jn", "jn", genFuncType<Ty::Real<8>, Ty::Integer<4>, Ty::Real<8>>,
      genLibCall},
     {"bessel_jn", RTNAME_STRING(JnF128), FuncTypeReal16Integer4Real16,
      genLibF128Call},
+    {"bessel_jn", "octa_jn", FuncTypeReal32Integer4Real32,
+     genLibOctaBesselN},
     {"bessel_y0", "y0f", genFuncType<Ty::Real<4>, Ty::Real<4>>, genLibCall},
     {"bessel_y0", "y0", genFuncType<Ty::Real<8>, Ty::Real<8>>, genLibCall},
     {"bessel_y0", RTNAME_STRING(Y0F128), FuncTypeReal16Real16, genLibF128Call},
+    {"bessel_y0", "octa_y0", FuncTypeReal32Real32, genLibOctaCall},
     {"bessel_y1", "y1f", genFuncType<Ty::Real<4>, Ty::Real<4>>, genLibCall},
     {"bessel_y1", "y1", genFuncType<Ty::Real<8>, Ty::Real<8>>, genLibCall},
     {"bessel_y1", RTNAME_STRING(Y1F128), FuncTypeReal16Real16, genLibF128Call},
+    {"bessel_y1", "octa_y1", FuncTypeReal32Real32, genLibOctaCall},
     {"bessel_yn", "ynf", genFuncType<Ty::Real<4>, Ty::Integer<4>, Ty::Real<4>>,
      genLibCall},
     {"bessel_yn", "yn", genFuncType<Ty::Real<8>, Ty::Integer<4>, Ty::Real<8>>,
      genLibCall},
     {"bessel_yn", RTNAME_STRING(YnF128), FuncTypeReal16Integer4Real16,
      genLibF128Call},
+    {"bessel_yn", "octa_yn", FuncTypeReal32Integer4Real32,
+     genLibOctaBesselN},
     // math::CeilOp returns a real, while Fortran CEILING returns integer.
     {"ceil", "ceilf", genFuncType<Ty::Real<4>, Ty::Real<4>>,
      genMathOp<mlir::math::CeilOp>},
@@ -1811,6 +1959,7 @@ static constexpr MathOperation mathOperations[] = {
     {"cosh", "cosh", genFuncType<Ty::Real<8>, Ty::Real<8>>,
      genMathOp<mlir::math::CoshOp>},
     {"cosh", RTNAME_STRING(CoshF128), FuncTypeReal16Real16, genLibF128Call},
+    {"cosh", "octa_cosh", FuncTypeReal32Real32, genLibOctaCall},
     {"cosh", "ccoshf", genFuncType<Ty::Complex<4>, Ty::Complex<4>>, genLibCall},
     {"cosh", "ccosh", genFuncType<Ty::Complex<8>, Ty::Complex<8>>, genLibCall},
     {"cosh", RTNAME_STRING(CCoshF128), FuncTypeComplex16Complex16,
@@ -1931,6 +2080,7 @@ static constexpr MathOperation mathOperations[] = {
     {"log_gamma", "lgamma", genFuncType<Ty::Real<8>, Ty::Real<8>>, genLibCall},
     {"log_gamma", RTNAME_STRING(LgammaF128), FuncTypeReal16Real16,
      genLibF128Call},
+    {"log_gamma", "octa_lgamma", FuncTypeReal32Real32, genLibOctaCall},
     {"nearbyint", "llvm.nearbyint.f32", genFuncType<Ty::Real<4>, Ty::Real<4>>,
      genLibCall},
     {"nearbyint", "llvm.nearbyint.f64", genFuncType<Ty::Real<8>, Ty::Real<8>>,
@@ -1987,6 +2137,14 @@ static constexpr MathOperation mathOperations[] = {
      genMathOp<mlir::complex::PowOp>},
     {"pow", RTNAME_STRING(CPowF128), FuncTypeComplex16Complex16Complex16,
      genMathOp<mlir::complex::PowOp>},
+    {"pow", "octa_cpow", FuncTypeComplex32Complex32Complex32,
+     genLibOctaComplexCall},
+    {"pow", "octa_cpow",
+     genFuncType<Ty::Complex<32>, Ty::Complex<32>, Ty::Integer<4>>,
+     genLibOctaCPowI},
+    {"pow", "octa_cpow",
+     genFuncType<Ty::Complex<32>, Ty::Complex<32>, Ty::Integer<8>>,
+     genLibOctaCPowI},
     {"pow", RTNAME_STRING(FPow4i),
      genFuncType<Ty::Real<4>, Ty::Real<4>, Ty::Integer<4>>,
      genMathOp<mlir::math::FPowIOp>},
@@ -2063,6 +2221,7 @@ static constexpr MathOperation mathOperations[] = {
     {"sinh", "sinh", genFuncType<Ty::Real<8>, Ty::Real<8>>,
      genMathOp<mlir::math::SinhOp>},
     {"sinh", RTNAME_STRING(SinhF128), FuncTypeReal16Real16, genLibF128Call},
+    {"sinh", "octa_sinh", FuncTypeReal32Real32, genLibOctaCall},
     {"sinh", "csinhf", genFuncType<Ty::Complex<4>, Ty::Complex<4>>, genLibCall},
     {"sinh", "csinh", genFuncType<Ty::Complex<8>, Ty::Complex<8>>, genLibCall},
     {"sinh", RTNAME_STRING(CSinhF128), FuncTypeComplex16Complex16,
@@ -2102,6 +2261,7 @@ static constexpr MathOperation mathOperations[] = {
     {"tanh", "tanh", genFuncType<Ty::Real<8>, Ty::Real<8>>,
      genMathOp<mlir::math::TanhOp>},
     {"tanh", RTNAME_STRING(TanhF128), FuncTypeReal16Real16, genLibF128Call},
+    {"tanh", "octa_tanh", FuncTypeReal32Real32, genLibOctaCall},
     {"tanh", "ctanhf", genFuncType<Ty::Complex<4>, Ty::Complex<4>>,
      genComplexMathOp<mlir::complex::TanhOp>},
     {"tanh", "ctanh", genFuncType<Ty::Complex<8>, Ty::Complex<8>>,
@@ -8348,6 +8508,12 @@ mlir::Value IntrinsicLibrary::genErfcScaled(mlir::Type resultType,
                                             llvm::ArrayRef<mlir::Value> args) {
   assert(args.size() == 1);
 
+  // exp(x*x)*erfc(x), which stays finite where erfc itself underflows - the
+  // reason this is an intrinsic rather than a composition, and the reason it
+  // cannot be assembled here from the erf row in the table.
+  if (fir::isa_octuple_real(resultType))
+    return genOctaUnary(builder, loc, "octa_erfc_scaled", args[0]);
+
   return builder.createConvert(
       loc, resultType,
       fir::runtime::genErfcScaled(builder, loc, fir::getBase(args[0])));
@@ -8612,6 +8778,12 @@ IntrinsicLibrary::genSelectedRealKind(mlir::Type resultType,
 mlir::Value IntrinsicLibrary::genSetExponent(mlir::Type resultType,
                                              llvm::ArrayRef<mlir::Value> args) {
   assert(args.size() == 2);
+
+  // Exact, like the rest of the model family, so it takes no rounding mode:
+  // genOctaModel is the right helper and genLibOctaCall would push an argument
+  // the callee does not have.
+  if (fir::isa_octuple_real(resultType))
+    return genOctaModel(builder, loc, "octa_set_exponent", args[0], args[1]);
 
   return builder.createConvert(
       loc, resultType,
