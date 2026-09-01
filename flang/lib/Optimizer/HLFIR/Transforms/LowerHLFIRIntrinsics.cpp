@@ -10,6 +10,7 @@
 #include "flang/Optimizer/Builder/FIRBuilder.h"
 #include "flang/Optimizer/Builder/HLFIRTools.h"
 #include "flang/Optimizer/Builder/IntrinsicCall.h"
+#include "flang/Optimizer/Builder/Todo.h"
 #include "flang/Optimizer/Dialect/FIRType.h"
 #include "flang/Optimizer/Dialect/Support/FIRContext.h"
 #include "flang/Optimizer/HLFIR/HLFIRDialect.h"
@@ -327,6 +328,76 @@ protected:
     return lowerArguments(operation, inArgs, rewriter, argLowering);
   };
 
+  /// The identity of the reduction, as a binary256 bit pattern.
+  ///
+  /// 1.0 has exponent 262143 = 0x3FFFF in bits 62..44 and a zero fraction; an
+  /// infinity has the exponent all ones, 0x7FFFF; HUGE has 0x7FFFE and every
+  /// fraction bit set. The sign is bit 63. MAXVAL and MINVAL seed with an
+  /// infinity rather than -/+ HUGE, because seeding with HUGE would return
+  /// HUGE for an array whose elements are all infinite; the standard's empty
+  /// answer is put back afterwards, so neither case is traded for the other.
+  mlir::Value octaInit(mlir::Location loc, fir::FirOpBuilder &builder) const {
+    if constexpr (std::is_same_v<OP, hlfir::SumOp>)
+      return genOcta(loc, builder, 0, 0);
+    else if constexpr (std::is_same_v<OP, hlfir::ProductOp>)
+      return genOcta(loc, builder, 0x3FFFF00000000000ULL, 0);
+    else if constexpr (std::is_same_v<OP, hlfir::MaxvalOp>)
+      return genOcta(loc, builder, 0xFFFFF00000000000ULL, 0); // -infinity
+    else
+      return genOcta(loc, builder, 0x7FFFF00000000000ULL, 0); // +infinity
+  }
+
+  /// One accumulation step, shared by the total reduction and the DIM form.
+  ///
+  /// SUM carries a compensation term as a second value. That is not a
+  /// refinement of my own: flang-rt/lib/runtime/sum.cpp accumulates every
+  /// other real kind with Kahan summation, and a REAL(32) that summed naively
+  /// would be the one kind that behaves differently. The extra width is not an
+  /// argument against it - binary64 has 53 bits and compensates, and the
+  /// cancellation Kahan repairs grows with the number of terms, not with the
+  /// format.
+  llvm::SmallVector<mlir::Value>
+  octaStep(mlir::Location l, fir::FirOpBuilder &b, hlfir::Entity array,
+           mlir::ValueRange idx, mlir::ValueRange acc) const {
+    constexpr bool isSum = std::is_same_v<OP, hlfir::SumOp>;
+    constexpr bool isProduct = std::is_same_v<OP, hlfir::ProductOp>;
+    constexpr bool isMax = std::is_same_v<OP, hlfir::MaxvalOp>;
+
+    hlfir::Entity elem = hlfir::loadElementAt(l, b, array, idx);
+    mlir::Value cur = acc[0];
+    if constexpr (isSum) {
+      mlir::Value corr = acc[1];
+      mlir::Value next = genOctaBinary(l, b, "octa_sub", elem, corr);
+      // Both arms are computed and selected rather than branched on: each is a
+      // handful of library calls, and control flow here would have to be
+      // threaded through the reduction values by hand.
+      mlir::Value sumIfNan = genOctaBinary(l, b, "octa_add", cur, elem);
+      mlir::Value sumOk = genOctaBinary(l, b, "octa_add", cur, next);
+      mlir::Value diff = genOctaBinary(l, b, "octa_sub", sumOk, cur);
+      mlir::Value corrOk = genOctaBinary(l, b, "octa_sub", diff, next);
+      // next != next, i.e. an Inf - Inf that produced a NaN correction.
+      mlir::Value unordered;
+      (void)genOctaCmp(l, b, next, next, &unordered);
+      mlir::Value zeroI32 = b.createIntegerConstant(l, b.getI32Type(), 0);
+      mlir::Value isNan = mlir::arith::CmpIOp::create(
+          b, l, mlir::arith::CmpIPredicate::ne, unordered, zeroI32);
+      mlir::Value zero = genOcta(l, b, 0, 0);
+      return {mlir::arith::SelectOp::create(b, l, isNan, sumIfNan, sumOk),
+              mlir::arith::SelectOp::create(b, l, isNan, zero, corrOk)};
+    } else if constexpr (isProduct) {
+      return {genOctaBinary(l, b, "octa_mul", cur, elem)};
+    } else {
+      mlir::Value code = genOctaCmp(l, b, elem, cur);
+      mlir::Value zero = b.createIntegerConstant(l, b.getI32Type(), 0);
+      mlir::Value take = mlir::arith::CmpIOp::create(
+          b, l,
+          isMax ? mlir::arith::CmpIPredicate::sgt
+                : mlir::arith::CmpIPredicate::slt,
+          code, zero);
+      return {mlir::arith::SelectOp::create(b, l, take, elem, cur)};
+    }
+  }
+
   /// Total SUM/PRODUCT/MAXVAL/MINVAL over a REAL(32) array, as a loop of
   /// liboctamath calls.
   ///
@@ -346,29 +417,11 @@ protected:
     constexpr bool isProduct = std::is_same_v<OP, hlfir::ProductOp>;
     constexpr bool isMax = std::is_same_v<OP, hlfir::MaxvalOp>;
 
-    // 1.0 has exponent 262143 = 0x3FFFF in bits 62..44 and a zero fraction;
-    // an infinity has the exponent all ones, 0x7FFFF; HUGE has 0x7FFFE and
-    // every fraction bit set. The sign is bit 63.
-    mlir::Value init;
-    if constexpr (isSum)
-      init = genOcta(loc, builder, 0, 0);
-    else if constexpr (isProduct)
-      init = genOcta(loc, builder, 0x3FFFF00000000000ULL, 0);
-    else if constexpr (isMax)
-      init = genOcta(loc, builder, 0xFFFFF00000000000ULL, 0); // -infinity
-    else
-      init = genOcta(loc, builder, 0x7FFFF00000000000ULL, 0); // +infinity
+    mlir::Value init = octaInit(loc, builder);
 
     llvm::SmallVector<mlir::Value> extents =
         hlfir::genExtentsVector(loc, builder, array);
 
-    // SUM carries a compensation term as a second loop-carried value. That is
-    // not a refinement of my own: flang-rt/lib/runtime/sum.cpp accumulates
-    // every other real kind with Kahan summation, and a REAL(32) that summed
-    // naively would be the one kind that behaves differently. The extra width
-    // is not an argument against it - binary64 has 53 bits and compensates,
-    // and the cancellation Kahan repairs is proportional to the number of
-    // terms, not to the format.
     llvm::SmallVector<mlir::Value> inits{init};
     if constexpr (isSum)
       inits.push_back(genOcta(loc, builder, 0, 0)); // correction
@@ -398,39 +451,7 @@ protected:
     auto step = [&](mlir::Location l, fir::FirOpBuilder &b,
                     mlir::ValueRange idx,
                     mlir::ValueRange acc) -> llvm::SmallVector<mlir::Value> {
-      hlfir::Entity elem = hlfir::loadElementAt(l, b, array, idx);
-      mlir::Value cur = acc[0];
-      if constexpr (isSum) {
-        mlir::Value corr = acc[1];
-        mlir::Value next = genOctaBinary(l, b, "octa_sub", elem, corr);
-        // Both arms are computed and selected rather than branched on: each
-        // is a handful of library calls, and control flow here would have to
-        // be threaded through the reduction values by hand.
-        mlir::Value sumIfNan = genOctaBinary(l, b, "octa_add", cur, elem);
-        mlir::Value sumOk = genOctaBinary(l, b, "octa_add", cur, next);
-        mlir::Value diff = genOctaBinary(l, b, "octa_sub", sumOk, cur);
-        mlir::Value corrOk = genOctaBinary(l, b, "octa_sub", diff, next);
-        // next != next, i.e. an Inf - Inf that produced a NaN correction.
-        mlir::Value unordered;
-        (void)genOctaCmp(l, b, next, next, &unordered);
-        mlir::Value zeroI32 = b.createIntegerConstant(l, b.getI32Type(), 0);
-        mlir::Value isNan = mlir::arith::CmpIOp::create(
-            b, l, mlir::arith::CmpIPredicate::ne, unordered, zeroI32);
-        mlir::Value zero = genOcta(l, b, 0, 0);
-        return {mlir::arith::SelectOp::create(b, l, isNan, sumIfNan, sumOk),
-                mlir::arith::SelectOp::create(b, l, isNan, zero, corrOk)};
-      } else if constexpr (isProduct) {
-        return {genOctaBinary(l, b, "octa_mul", cur, elem)};
-      } else {
-        mlir::Value code = genOctaCmp(l, b, elem, cur);
-        mlir::Value zero = b.createIntegerConstant(l, b.getI32Type(), 0);
-        mlir::Value take = mlir::arith::CmpIOp::create(
-            b, l,
-            isMax ? mlir::arith::CmpIPredicate::sgt
-                  : mlir::arith::CmpIPredicate::slt,
-            code, zero);
-        return {mlir::arith::SelectOp::create(b, l, take, elem, cur)};
-      }
+      return octaStep(l, b, array, idx, acc);
     };
 
     // The mask is applied by selecting between the stepped accumulator and the
@@ -495,6 +516,130 @@ protected:
     }
 
     rewriter.replaceOp(operation, reduced);
+    return mlir::success();
+  }
+
+  /// SUM/PRODUCT/MAXVAL/MINVAL over one dimension of a REAL(32) array.
+  ///
+  /// The result is rank n-1: one reduction per output element, each over the
+  /// single contracted extent. The accumulation step is the one the total
+  /// reduction uses, called through octaStep rather than copied, because two
+  /// copies of a compensated sum are two things that can disagree about a
+  /// digit - and the disagreement would appear only with DIM, which is the
+  /// half nobody looks at.
+  ///
+  /// DIM must be a compile-time constant. A runtime DIM would mean choosing
+  /// which axis to contract while the loop nest is being built, and that is a
+  /// different construction rather than a parameter of this one; it is refused
+  /// before code is generated instead of being approximated here.
+  llvm::LogicalResult genOctaReductionDim(OP operation, fir::FirOpBuilder &builder,
+                                          mlir::Location loc,
+                                          hlfir::Entity array, mlir::Value mask,
+                                          unsigned dim,
+                                          mlir::PatternRewriter &rewriter) const {
+    constexpr bool isSum = std::is_same_v<OP, hlfir::SumOp>;
+    constexpr bool isProduct = std::is_same_v<OP, hlfir::ProductOp>;
+    constexpr bool isMax = std::is_same_v<OP, hlfir::MaxvalOp>;
+
+    llvm::SmallVector<mlir::Value> extents =
+        hlfir::genExtentsVector(loc, builder, array);
+    const unsigned rank = extents.size();
+    const unsigned axis = dim - 1;
+
+    mlir::Type idxTy = builder.getIndexType();
+    mlir::Type eleTy = builder.getIntegerType(256);
+
+    // The result shape is the argument's with the contracted extent removed.
+    llvm::SmallVector<mlir::Value> resExtents;
+    for (unsigned k = 0; k < rank; ++k)
+      if (k != axis)
+        resExtents.push_back(extents[k]);
+    mlir::Value shape = builder.genShape(loc, resExtents);
+
+    std::optional<hlfir::Entity> maskEntity;
+    mlir::Value scalarMask;
+    if (mask) {
+      maskEntity = hlfir::Entity{mask};
+      if (maskEntity->isScalar())
+        scalarMask = builder.createConvert(
+            loc, builder.getI1Type(),
+            hlfir::loadTrivialScalar(loc, builder, *maskEntity));
+    }
+    const bool needTaken = mask && !isSum && !isProduct;
+
+    hlfir::ElementalOp elemental = hlfir::genElementalOp(
+        loc, builder, eleTy, shape, /*typeParams=*/{},
+        [&](mlir::Location l, fir::FirOpBuilder &b,
+            mlir::ValueRange outIdx) -> hlfir::Entity {
+          llvm::SmallVector<mlir::Value> inits{octaInit(l, b)};
+          if constexpr (isSum)
+            inits.push_back(genOcta(l, b, 0, 0));
+          if (needTaken)
+            inits.push_back(b.createIntegerConstant(l, b.getI1Type(), 0));
+
+          auto body = [&](mlir::Location bl, fir::FirOpBuilder &bb,
+                          mlir::ValueRange inner,
+                          mlir::ValueRange acc)
+              -> llvm::SmallVector<mlir::Value> {
+            // Rebuild the argument's full subscript by putting the contracted
+            // loop's index back at the axis it came from.
+            llvm::SmallVector<mlir::Value> full;
+            for (unsigned k = 0, o = 0; k < rank; ++k)
+              full.push_back(k == axis ? inner[0] : outIdx[o++]);
+
+            const unsigned carried = needTaken ? acc.size() - 1 : acc.size();
+            llvm::SmallVector<mlir::Value> in(acc.begin(),
+                                              acc.begin() + carried);
+            llvm::SmallVector<mlir::Value> next =
+                octaStep(bl, bb, array, full, in);
+            if (!mask)
+              return next;
+
+            mlir::Value m = scalarMask;
+            if (!m) {
+              hlfir::Entity mElem =
+                  hlfir::loadElementAt(bl, bb, *maskEntity, full);
+              m = bb.createConvert(bl, bb.getI1Type(), mElem);
+            }
+            llvm::SmallVector<mlir::Value> out;
+            for (unsigned k = 0; k < carried; ++k)
+              out.push_back(
+                  mlir::arith::SelectOp::create(bb, bl, m, next[k], in[k]));
+            if (needTaken)
+              out.push_back(
+                  mlir::arith::OrIOp::create(bb, bl, acc[carried], m));
+            return out;
+          };
+
+          llvm::SmallVector<mlir::Value> red =
+              hlfir::genLoopNestWithReductions(l, b, {extents[axis]}, inits,
+                                               body, /*isUnordered=*/false);
+          mlir::Value v = red[0];
+          if constexpr (!isSum && !isProduct) {
+            // Same reconciliation as the total reduction: the seed is an
+            // infinity so that an all-infinite slice is not reported as HUGE,
+            // and the standard's empty answer is put back afterwards. Here
+            // "empty" is per output element, since one slice can be empty
+            // only if the contracted extent is zero - but with a mask it is
+            // per element in earnest, because a slice can be wholly masked
+            // out while its neighbour is not.
+            mlir::Value zeroIdx = b.createIntegerConstant(l, idxTy, 0);
+            mlir::Value empty = mlir::arith::CmpIOp::create(
+                b, l, mlir::arith::CmpIPredicate::eq, extents[axis], zeroIdx);
+            if (needTaken) {
+              mlir::Value one = b.createIntegerConstant(l, b.getI1Type(), 1);
+              empty = mlir::arith::XOrIOp::create(b, l, red.back(), one);
+            }
+            mlir::Value huge =
+                isMax ? genOcta(l, b, 0xFFFFEFFFFFFFFFFFULL, 1)
+                      : genOcta(l, b, 0x7FFFEFFFFFFFFFFFULL, 1);
+            v = mlir::arith::SelectOp::create(b, l, empty, huge, v);
+          }
+          return hlfir::Entity{v};
+        },
+        /*isUnordered=*/true, /*polymorphicMold=*/{}, operation.getType());
+
+    rewriter.replaceOp(operation, elemental.getResult());
     return mlir::success();
   }
 
@@ -661,9 +806,10 @@ public:
 
     // REAL(32) has no runtime kernel; the reduction is a loop of liboctamath
     // calls, emitted here. Total reductions are covered, with or without a
-    // MASK. DIM is not: it makes the result an array of partial reductions,
-    // which this does not build, and it falls through to the runtime and
-    // fails there by name rather than quietly summing the wrong axis.
+    // MASK, and so is DIM when it is a compile-time constant naming an axis of
+    // the argument. A runtime DIM would mean choosing which axis to contract
+    // while the loop nest is being built; that is refused below, before code
+    // is generated, rather than reaching the runtime and failing there.
     if constexpr (std::is_same_v<OP, hlfir::SumOp> ||
                   std::is_same_v<OP, hlfir::ProductOp> ||
                   std::is_same_v<OP, hlfir::MaxvalOp> ||
@@ -679,9 +825,26 @@ public:
         maskOk = !m.isBoxAddressOrValue() && !m.isPolymorphic() &&
                  (m.isScalar() || m.getRank() == array.getRank());
       }
-      if (eleTy.isInteger(256) && !operation.getDim() && maskOk)
-        return genOctaReduction(operation, opName, builder, loc, array, mask,
-                                rewriter);
+      if (eleTy.isInteger(256) && maskOk) {
+        if (!operation.getDim())
+          return genOctaReduction(operation, opName, builder, loc, array, mask,
+                                  rewriter);
+        if (std::optional<llvm::APInt> c =
+                fir::getIntIfConstant(operation.getDim())) {
+          int64_t d = c->getSExtValue();
+          if (d >= 1 && d <= array.getRank()) {
+            // A rank-1 argument with DIM=1 is a total reduction whose result
+            // the front end already types as a scalar; the elemental form
+            // would build a rank-0 array instead.
+            if (array.getRank() == 1)
+              return genOctaReduction(operation, opName, builder, loc, array,
+                                      mask, rewriter);
+            return genOctaReductionDim(operation, builder, loc, array, mask,
+                                       static_cast<unsigned>(d), rewriter);
+          }
+        }
+        TODO(loc, "REAL(KIND=32) reduction with a non-constant DIM");
+      }
     }
 
     // MINLOC/MAXLOC over REAL(32), any rank, with or without MASK. DIM is

@@ -1759,6 +1759,83 @@ static mlir::Value genOctaNorm2(fir::FirOpBuilder &builder, mlir::Location loc,
                                           /*isUnordered=*/false)[0];
 }
 
+/// FINDLOC over a REAL(32) array, as a loop carrying the subscripts of the
+/// match. There is no runtime kernel: the runtime's are templated over a C++
+/// element type binary256 does not have.
+///
+/// Equality is `octa_cmp` reporting ordered and equal, which decides two cases
+/// the bit pattern would get wrong. A NaN target finds nothing, because a NaN
+/// is unordered with everything including itself. And `findloc(a, -0.0)` finds
+/// a `+0.0`, because the two compare equal while their patterns differ - a
+/// comparison written as an integer equality would miss it, and would miss it
+/// only on an input somebody had to think to write.
+///
+/// The seed subscripts are 0, which is the standard's answer when there is no
+/// match and also when the array is empty, so neither needs reconciling after
+/// the loop. BACK is carried rather than branched on: with BACK the last match
+/// wins, so the element is taken whenever it is equal; without it, only when
+/// nothing has been taken yet. That is one select, and it works for a BACK
+/// that is not known until run time.
+static llvm::SmallVector<mlir::Value>
+genOctaFindloc(fir::FirOpBuilder &builder, mlir::Location loc,
+               hlfir::Entity array, mlir::Value val, mlir::Value mask,
+               mlir::Value back) {
+  llvm::SmallVector<mlir::Value> extents =
+      hlfir::genExtentsVector(loc, builder, array);
+  const unsigned rank = extents.size();
+  mlir::Type idxTy = builder.getIndexType();
+  mlir::Value zeroIdx = builder.createIntegerConstant(loc, idxTy, 0);
+
+  llvm::SmallVector<mlir::Value> inits;
+  for (unsigned k = 0; k < rank; ++k)
+    inits.push_back(zeroIdx);
+
+  std::optional<hlfir::Entity> maskEntity;
+  mlir::Value scalarMask;
+  if (mask) {
+    maskEntity = hlfir::Entity{mask};
+    if (maskEntity->isScalar())
+      scalarMask = builder.createConvert(
+          loc, builder.getI1Type(),
+          hlfir::loadTrivialScalar(loc, builder, *maskEntity));
+  }
+
+  auto body = [&](mlir::Location l, fir::FirOpBuilder &b, mlir::ValueRange i,
+                  mlir::ValueRange acc) -> llvm::SmallVector<mlir::Value> {
+    hlfir::Entity elem = hlfir::loadElementAt(l, b, array, i);
+    mlir::Value equal =
+        genOctaCmp(b, l, elem, val, mlir::arith::CmpIPredicate::eq);
+
+    mlir::Value zIdx = b.createIntegerConstant(l, b.getIndexType(), 0);
+    mlir::Value nothingYet = mlir::arith::CmpIOp::create(
+        b, l, mlir::arith::CmpIPredicate::eq, acc[0], zIdx);
+    mlir::Value first = nothingYet;
+    if (back) {
+      mlir::Value b1 = b.createConvert(l, b.getI1Type(), back);
+      first = mlir::arith::OrIOp::create(b, l, b1, nothingYet);
+    }
+    mlir::Value take = mlir::arith::AndIOp::create(b, l, equal, first);
+
+    // The mask gates the whole decision, not just the comparison: a
+    // masked-out element must not be taken merely because it matches.
+    if (mlir::Value m = scalarMask) {
+      take = mlir::arith::AndIOp::create(b, l, take, m);
+    } else if (mask) {
+      hlfir::Entity mElem = hlfir::loadElementAt(l, b, *maskEntity, i);
+      mlir::Value mBit = b.createConvert(l, b.getI1Type(), mElem);
+      take = mlir::arith::AndIOp::create(b, l, take, mBit);
+    }
+
+    llvm::SmallVector<mlir::Value> next;
+    for (unsigned k = 0; k < rank; ++k)
+      next.push_back(mlir::arith::SelectOp::create(b, l, take, i[k], acc[k]));
+    return next;
+  };
+
+  return hlfir::genLoopNestWithReductions(loc, builder, extents, inits, body,
+                                          /*isUnordered=*/false);
+}
+
 /// Mapping between mathematical intrinsic operations and MLIR operations
 /// of some appropriate dialect (math, complex, etc.) or libm calls.
 /// TODO: support remaining Fortran math intrinsics.
@@ -4840,6 +4917,57 @@ IntrinsicLibrary::genFindloc(mlir::Type resultType,
 
   // Check if dim argument is present
   bool absentDim = isStaticallyAbsent(args[2]);
+
+  // REAL(32) has no runtime kernel, so the search is a loop of liboctamath
+  // calls emitted here. DIM is refused rather than approximated: it makes the
+  // result an array of partial searches, which this does not build. The
+  // refusal is at compile time, which is where a user can act on it - the
+  // MASK case of MINLOC once compiled and died in the runtime instead, and
+  // that was worth fixing separately.
+  if (mlir::Type ety = fir::unwrapSequenceType(
+          fir::unwrapPassByRefType(fir::getBase(args[0]).getType()));
+      ety && ety.isInteger(256)) {
+    if (!absentDim)
+      TODO(loc, "FINDLOC with DIM over REAL(KIND=32)");
+    hlfir::Entity arrayEntity{fir::getBase(args[0])};
+    mlir::Value maskVal;
+    if (!isStaticallyAbsent(args[3])) {
+      hlfir::Entity m{fir::getBase(args[3])};
+      if (m.isBoxAddressOrValue() || m.isPolymorphic() ||
+          !(m.isScalar() || m.getRank() == arrayEntity.getRank()))
+        TODO(loc, "FINDLOC with this MASK over REAL(KIND=32)");
+      maskVal = fir::getBase(args[3]);
+    }
+    mlir::Value backVal =
+        isStaticallyAbsent(args[5]) ? mlir::Value{} : fir::getBase(args[5]);
+    mlir::Value target = hlfir::loadTrivialScalar(
+        loc, builder, hlfir::Entity{fir::getBase(args[1])});
+
+    llvm::SmallVector<mlir::Value> pos =
+        genOctaFindloc(builder, loc, arrayEntity, target, maskVal, backVal);
+
+    mlir::Type resEleTy = fir::unwrapSequenceType(resultType);
+    if (!resEleTy)
+      resEleTy = resultType;
+    llvm::SmallVector<mlir::Value> conv;
+    for (mlir::Value p : pos)
+      conv.push_back(builder.createConvert(loc, resEleTy, p));
+
+    // Without DIM the result is a rank-1 array of as many subscripts as the
+    // argument has dimensions, even when the argument is rank 1.
+    mlir::Value n =
+        builder.createIntegerConstant(loc, builder.getIndexType(), rank);
+    mlir::Value temp = builder.createTemporary(
+        loc, fir::SequenceType::get({static_cast<int64_t>(rank)}, resEleTy));
+    for (unsigned k = 0; k < rank; ++k) {
+      mlir::Value at =
+          builder.createIntegerConstant(loc, builder.getIndexType(), k);
+      mlir::Value addr = fir::CoordinateOp::create(
+          builder, loc, builder.getRefType(resEleTy), temp, at);
+      fir::StoreOp::create(builder, loc, conv[k], addr);
+    }
+    return fir::ArrayBoxValue{temp, {n}};
+  }
 
   // Handle optional mask argument
   auto mask = isStaticallyAbsent(args[3])
