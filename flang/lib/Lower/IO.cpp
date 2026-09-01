@@ -726,6 +726,18 @@ static bool isScalarComplex32(const Fortran::lower::SomeExpr *expr) {
          dt->kind() == 32;
 }
 
+/// An array of either kind reaches the runtime through a descriptor, where the
+/// element walk is templated on a C++ type binary256 does not have. That was
+/// left out of the scalar work and stated as left out; it is handled by
+/// genOutputReal32Array below.
+static bool isArrayReal32(const Fortran::lower::SomeExpr *expr) {
+  if (expr->Rank() == 0)
+    return false;
+  std::optional<Fortran::evaluate::DynamicType> dt = expr->GetType();
+  return dt && dt->category() == Fortran::common::TypeCategory::Real &&
+         dt->kind() == 32;
+}
+
 /// Emit list-directed output of a scalar REAL(32) through liboctamath.
 ///
 /// The runtime cannot format this type and is not asked to. flang-rt has no
@@ -752,14 +764,19 @@ static bool isScalarComplex32(const Fortran::lower::SomeExpr *expr) {
 /// 13 on the next line.
 ///
 /// What this does not cover, stated because the omission is invisible from
-/// here: arrays and anything that goes through a descriptor. Those reach
-/// OutputDescriptor with a type code the runtime has no case for.
-static void genOutputReal32(Fortran::lower::AbstractConverter &converter,
-                            mlir::Location loc, mlir::Value cookie,
-                            const Fortran::lower::SomeExpr *expr,
-                            Fortran::lower::StatementContext &stmtCtx,
-                            mlir::Value &ok) {
-  fir::FirOpBuilder &builder = converter.getFirOpBuilder();
+/// here: COMPLEX(32) arrays, which still reach OutputDescriptor with a type
+/// code the runtime has no case for. REAL(32) arrays are handled by
+/// genOutputReal32Array.
+/// Format one binary256 value, held in `slot`, and emit it.
+///
+/// Factored out of genOutputReal32 so that the scalar and array paths cannot
+/// format differently. They are one piece of code, so a change to either is a
+/// change to both; two copies would eventually disagree about a digit, and the
+/// disagreement would only show on arrays, which nothing printed at all for
+/// the first day this type existed.
+static mlir::Value genOctaFormatAndEmit(fir::FirOpBuilder &builder,
+                                        mlir::Location loc, mlir::Value cookie,
+                                        mlir::Value slot) {
   mlir::Type i256 = builder.getIntegerType(256);
   mlir::Type i8 = builder.getIntegerType(8);
   mlir::Type i32 = builder.getI32Type();
@@ -772,12 +789,8 @@ static void genOutputReal32(Fortran::lower::AbstractConverter &converter,
   constexpr std::int64_t bufLen = 128;
   mlir::Type bufTy = fir::SequenceType::get({bufLen}, i8);
   mlir::Value buf = fir::AllocaOp::create(builder, loc, bufTy);
-  mlir::Value bufPtr = builder.createConvert(
-      loc, fir::ReferenceType::get(i8), buf);
-
-  mlir::Value value = fir::getBase(converter.genExprValue(loc, expr, stmtCtx));
-  mlir::Value slot = fir::AllocaOp::create(builder, loc, i256);
-  fir::StoreOp::create(builder, loc, value, slot);
+  mlir::Value bufPtr =
+      builder.createConvert(loc, fir::ReferenceType::get(i8), buf);
 
   mlir::FunctionType fmtTy = builder.getFunctionType(
       {fir::ReferenceType::get(i8), i64, fir::ReferenceType::get(i256)}, {i32});
@@ -788,10 +801,9 @@ static void genOutputReal32(Fortran::lower::AbstractConverter &converter,
                      builder.getUnitAttr());
   }
   mlir::Value cap = builder.createIntegerConstant(loc, i64, bufLen);
-  mlir::Value len =
-      fir::CallOp::create(builder, loc, fmtFunc,
-                          mlir::ValueRange{bufPtr, cap, slot})
-          .getResult(0);
+  mlir::Value len = fir::CallOp::create(builder, loc, fmtFunc,
+                                        mlir::ValueRange{bufPtr, cap, slot})
+                        .getResult(0);
 
   // A negative length means the value could not be formatted. Clamping it to
   // zero would print an empty field and look like a value that happens to be
@@ -802,8 +814,8 @@ static void genOutputReal32(Fortran::lower::AbstractConverter &converter,
   mlir::Value zero = builder.createIntegerConstant(loc, i32, 0);
   mlir::Value ok32 = mlir::arith::CmpIOp::create(
       builder, loc, mlir::arith::CmpIPredicate::sgt, len, zero);
-  mlir::Value safeLen = mlir::arith::SelectOp::create(builder, loc, ok32, len,
-                                                      zero);
+  mlir::Value safeLen =
+      mlir::arith::SelectOp::create(builder, loc, ok32, len, zero);
   mlir::Value lenArg = builder.createConvert(loc, i64, safeLen);
 
   mlir::func::FuncOp outputFunc =
@@ -814,7 +826,92 @@ static void genOutputReal32(Fortran::lower::AbstractConverter &converter,
   llvm::SmallVector<mlir::Value> args = {
       cookie, builder.createConvert(loc, ptrArg, bufPtr),
       builder.createConvert(loc, lenTy, lenArg)};
-  ok = fir::CallOp::create(builder, loc, outputFunc, args).getResult(0);
+  return fir::CallOp::create(builder, loc, outputFunc, args).getResult(0);
+}
+
+static void genOutputReal32(Fortran::lower::AbstractConverter &converter,
+                            mlir::Location loc, mlir::Value cookie,
+                            const Fortran::lower::SomeExpr *expr,
+                            Fortran::lower::StatementContext &stmtCtx,
+                            mlir::Value &ok) {
+  fir::FirOpBuilder &builder = converter.getFirOpBuilder();
+  mlir::Type i256 = builder.getIntegerType(256);
+  mlir::Value value = fir::getBase(converter.genExprValue(loc, expr, stmtCtx));
+  mlir::Value slot = fir::AllocaOp::create(builder, loc, i256);
+  fir::StoreOp::create(builder, loc, value, slot);
+  ok = genOctaFormatAndEmit(builder, loc, cookie, slot);
+}
+
+/// Emit list-directed output of a REAL(32) array, one element at a time.
+///
+/// The runtime cannot walk this one for us. Its descriptor path,
+/// FormattedRealIO in flang-rt/lib/runtime/descriptor-io.cpp, is templated on
+/// RealOutputEditing<KIND>::BinaryFloatingPoint - a C++ type that does not
+/// exist for binary256 and cannot, because the decimal conversion behind it is
+/// exactly the one flang-rt is deliberately without. So the walk happens here,
+/// where the conversion is available, and the runtime is handed only finished
+/// characters, which it already knows how to place.
+///
+/// The loop nest is built from the descriptor rather than from a compile-time
+/// shape, so a section, an assumed-shape dummy and a non-contiguous slice all
+/// work: fir.array_coor applies the box's own strides. The first subscript
+/// varies fastest, which is the order Fortran requires for list-directed
+/// output and the order the runtime would have used.
+static void genOutputReal32Array(Fortran::lower::AbstractConverter &converter,
+                                 mlir::Location loc, mlir::Value cookie,
+                                 const Fortran::lower::SomeExpr *expr,
+                                 Fortran::lower::StatementContext &stmtCtx,
+                                 mlir::Value &ok) {
+  fir::FirOpBuilder &builder = converter.getFirOpBuilder();
+  mlir::Type i256 = builder.getIntegerType(256);
+  mlir::Type idxTy = builder.getIndexType();
+  mlir::Value one = builder.createIntegerConstant(loc, idxTy, 1);
+  mlir::Value zero = builder.createIntegerConstant(loc, idxTy, 0);
+
+  mlir::Value box = fir::getBase(converter.genExprBox(loc, *expr, stmtCtx));
+  unsigned rank = fir::getBoxRank(box.getType());
+
+  // Extents come from the descriptor. The lower bound is deliberately not
+  // taken from it: fir.array_coor with a plain fir.shape addresses from 1, and
+  // a section carries its own origin inside the box, so asking the box for a
+  // lower bound here would apply it twice.
+  llvm::SmallVector<mlir::Value> extents;
+  for (unsigned d = 0; d < rank; ++d) {
+    mlir::Value dim = builder.createIntegerConstant(loc, idxTy, d);
+    auto dims =
+        fir::BoxDimsOp::create(builder, loc, idxTy, idxTy, idxTy, box, dim);
+    extents.push_back(dims.getResult(1));
+  }
+  mlir::Value shape = fir::ShapeOp::create(builder, loc, extents);
+
+  // Built from the last dimension inwards so that the first subscript is the
+  // innermost loop and therefore varies fastest.
+  llvm::SmallVector<fir::DoLoopOp> loops;
+  llvm::SmallVector<mlir::Value> ivs(rank);
+  for (unsigned d = rank; d-- > 0;) {
+    mlir::Value ub = mlir::arith::SubIOp::create(builder, loc, extents[d], one);
+    auto loop = fir::DoLoopOp::create(builder, loc, zero, ub, one,
+                                      /*unordered=*/false,
+                                      /*finalCountValue=*/false);
+    builder.setInsertionPointToStart(loop.getBody());
+    ivs[d] =
+        mlir::arith::AddIOp::create(builder, loc, loop.getInductionVar(), one);
+    loops.push_back(loop);
+  }
+
+  mlir::Value addr = fir::ArrayCoorOp::create(
+      builder, loc, fir::ReferenceType::get(i256), box, shape,
+      /*slice=*/mlir::Value{}, ivs, /*typeparams=*/mlir::ValueRange{});
+  mlir::Value elem = fir::LoadOp::create(builder, loc, addr);
+  mlir::Value slot = fir::AllocaOp::create(builder, loc, i256);
+  fir::StoreOp::create(builder, loc, elem, slot);
+  genOctaFormatAndEmit(builder, loc, cookie, slot);
+
+  builder.setInsertionPointAfter(loops.front());
+  // `ok` is left as the caller set it. Threading a per-element status out of
+  // the nest would need an iter_arg on every loop, and every caller uses `ok`
+  // only to decide whether the statement is still live - which for one output
+  // item is the question the last element already answered.
 }
 
 /// Emit list-directed output of a scalar COMPLEX(32).
@@ -939,6 +1036,10 @@ static void genOutputItemList(
     }
     if (isFormatted && isScalarComplex32(expr)) {
       genOutputComplex32(converter, loc, cookie, expr, stmtCtx, ok);
+      continue;
+    }
+    if (isFormatted && isArrayReal32(expr)) {
+      genOutputReal32Array(converter, loc, cookie, expr, stmtCtx, ok);
       continue;
     }
     mlir::Type itemTy = converter.genType(*expr);
@@ -1111,12 +1212,13 @@ createIoRuntimeCallForItem(Fortran::lower::AbstractConverter &converter,
 /// imposes that the runtime's own does not: a field longer than it is an
 /// error rather than a truncation, because a truncated decimal string is a
 /// different number.
-static void genInputReal32(Fortran::lower::AbstractConverter &converter,
-                           mlir::Location loc, mlir::Value cookie,
-                           const Fortran::lower::SomeExpr *expr,
-                           Fortran::lower::StatementContext &stmtCtx,
-                           mlir::Value &ok) {
-  fir::FirOpBuilder &builder = converter.getFirOpBuilder();
+/// Read one field and store the binary256 it holds into `addr`.
+///
+/// Factored out for the same reason as genOctaFormatAndEmit on the output
+/// side: the scalar and array paths must not be able to parse differently.
+static mlir::Value genOctaScanAndParse(fir::FirOpBuilder &builder,
+                                       mlir::Location loc, mlir::Value cookie,
+                                       mlir::Value addr) {
   mlir::Type i256 = builder.getIntegerType(256);
   mlir::Type i8 = builder.getIntegerType(8);
   mlir::Type i32 = builder.getI32Type();
@@ -1141,7 +1243,8 @@ static void genInputReal32(Fortran::lower::AbstractConverter &converter,
   llvm::SmallVector<mlir::Value> args = {
       cookie, builder.createConvert(loc, ptrArg, bufPtr),
       builder.createConvert(loc, lenTy, cap)};
-  ok = fir::CallOp::create(builder, loc, inputFunc, args).getResult(0);
+  mlir::Value ok = fir::CallOp::create(builder, loc, inputFunc, args)
+                       .getResult(0);
 
   // An empty string is a list-directed null value: the standard says the
   // variable keeps its previous value, so nothing is assigned. Converting the
@@ -1152,17 +1255,14 @@ static void genInputReal32(Fortran::lower::AbstractConverter &converter,
   mlir::Value hasText = mlir::arith::CmpIOp::create(
       builder, loc, mlir::arith::CmpIPredicate::ne, first, nul);
 
-  mlir::Value addr = fir::getBase(converter.genExprAddr(loc, expr, stmtCtx));
   builder.genIfThen(loc, hasText)
       .genThen([&]() {
         mlir::Value slot = fir::AllocaOp::create(builder, loc, i256);
         // The third parameter is `const char **`, but FIR has no reference to
         // a reference, so it is declared as an opaque pointer - which is what
         // it lowers to anyway - and a null of that type is passed.
-        mlir::FunctionType parseTy =
-            builder.getFunctionType({fir::ReferenceType::get(i256), i8Ref,
-                                     i8Ref},
-                                    {i32});
+        mlir::FunctionType parseTy = builder.getFunctionType(
+            {fir::ReferenceType::get(i256), i8Ref, i8Ref}, {i32});
         mlir::func::FuncOp parseFunc =
             builder.getNamedFunction("octa_from_string");
         if (!parseFunc) {
@@ -1177,11 +1277,74 @@ static void genInputReal32(Fortran::lower::AbstractConverter &converter,
         fir::CallOp::create(builder, loc, parseFunc,
                             mlir::ValueRange{slot, bufPtr, nullEnd});
         mlir::Value value = fir::LoadOp::create(builder, loc, slot);
-        fir::StoreOp::create(builder, loc, value,
-                             builder.createConvert(
-                                 loc, fir::ReferenceType::get(i256), addr));
+        fir::StoreOp::create(
+            builder, loc, value,
+            builder.createConvert(loc, fir::ReferenceType::get(i256), addr));
       })
       .end();
+  return ok;
+}
+
+static void genInputReal32(Fortran::lower::AbstractConverter &converter,
+                           mlir::Location loc, mlir::Value cookie,
+                           const Fortran::lower::SomeExpr *expr,
+                           Fortran::lower::StatementContext &stmtCtx,
+                           mlir::Value &ok) {
+  fir::FirOpBuilder &builder = converter.getFirOpBuilder();
+  mlir::Value addr = fir::getBase(converter.genExprAddr(loc, expr, stmtCtx));
+  ok = genOctaScanAndParse(builder, loc, cookie, addr);
+}
+
+/// Read a REAL(32) array, one element at a time.
+///
+/// The mirror of genOutputReal32Array, and it exists for the same reason: the
+/// runtime's descriptor walk is templated on a C++ element type binary256 does
+/// not have. It was missed when the input side was written, because that task
+/// was scoped as "make read work" and a scalar read made it work; the array
+/// half had nobody to notice it, which is the shape of gap this whole series
+/// keeps finding.
+static void genInputReal32Array(Fortran::lower::AbstractConverter &converter,
+                                mlir::Location loc, mlir::Value cookie,
+                                const Fortran::lower::SomeExpr *expr,
+                                Fortran::lower::StatementContext &stmtCtx,
+                                mlir::Value &ok) {
+  fir::FirOpBuilder &builder = converter.getFirOpBuilder();
+  mlir::Type i256 = builder.getIntegerType(256);
+  mlir::Type idxTy = builder.getIndexType();
+  mlir::Value one = builder.createIntegerConstant(loc, idxTy, 1);
+  mlir::Value zero = builder.createIntegerConstant(loc, idxTy, 0);
+
+  mlir::Value box = fir::getBase(converter.genExprBox(loc, *expr, stmtCtx));
+  unsigned rank = fir::getBoxRank(box.getType());
+
+  llvm::SmallVector<mlir::Value> extents;
+  for (unsigned d = 0; d < rank; ++d) {
+    mlir::Value dim = builder.createIntegerConstant(loc, idxTy, d);
+    auto dims =
+        fir::BoxDimsOp::create(builder, loc, idxTy, idxTy, idxTy, box, dim);
+    extents.push_back(dims.getResult(1));
+  }
+  mlir::Value shape = fir::ShapeOp::create(builder, loc, extents);
+
+  llvm::SmallVector<fir::DoLoopOp> loops;
+  llvm::SmallVector<mlir::Value> ivs(rank);
+  for (unsigned d = rank; d-- > 0;) {
+    mlir::Value ub = mlir::arith::SubIOp::create(builder, loc, extents[d], one);
+    auto loop = fir::DoLoopOp::create(builder, loc, zero, ub, one,
+                                      /*unordered=*/false,
+                                      /*finalCountValue=*/false);
+    builder.setInsertionPointToStart(loop.getBody());
+    ivs[d] =
+        mlir::arith::AddIOp::create(builder, loc, loop.getInductionVar(), one);
+    loops.push_back(loop);
+  }
+
+  mlir::Value addr = fir::ArrayCoorOp::create(
+      builder, loc, fir::ReferenceType::get(i256), box, shape,
+      /*slice=*/mlir::Value{}, ivs, /*typeparams=*/mlir::ValueRange{});
+  genOctaScanAndParse(builder, loc, cookie, addr);
+
+  builder.setInsertionPointAfter(loops.front());
 }
 
 static void genInputItemList(Fortran::lower::AbstractConverter &converter,
@@ -1233,6 +1396,10 @@ static void genInputItemList(Fortran::lower::AbstractConverter &converter,
     }
     if (isFormatted && isScalarReal32(expr)) {
       genInputReal32(converter, loc, cookie, expr, stmtCtx, ok);
+      continue;
+    }
+    if (isFormatted && isArrayReal32(expr)) {
+      genInputReal32Array(converter, loc, cookie, expr, stmtCtx, ok);
       continue;
     }
     mlir::Type itemTy = converter.genType(*expr);
