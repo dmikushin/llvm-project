@@ -436,6 +436,84 @@ protected:
     return mlir::success();
   }
 
+  /// MINLOC/MAXLOC over a rank-1 REAL(32) array, as a loop of liboctamath
+  /// calls carrying both the best value and its position.
+  ///
+  /// Ties go to the first occurrence, which the standard requires, and which
+  /// falls out of comparing strictly: a later equal element gives code 0 and
+  /// is not taken. That is worth stating because the non-strict form is the
+  /// natural thing to write and is wrong only on inputs with a repeat.
+  ///
+  /// The seed position is 0, and an element is taken when the position is
+  /// still 0 regardless of the comparison. That gives the standard's answer
+  /// for an empty array - zero, since the loop never runs - without a second
+  /// reconciliation step, and it decides the NaN case: a NaN never compares
+  /// better, so it is selected only when it is the first element and nothing
+  /// ordered ever displaces it.
+  llvm::LogicalResult genOctaMinMaxLoc(OP operation, fir::FirOpBuilder &builder,
+                                       mlir::Location loc, hlfir::Entity array,
+                                       mlir::PatternRewriter &rewriter) const {
+    constexpr bool isMin = std::is_same_v<OP, hlfir::MinlocOp>;
+    llvm::SmallVector<mlir::Value> extents =
+        hlfir::genExtentsVector(loc, builder, array);
+
+    mlir::Type idxTy = builder.getIndexType();
+    llvm::SmallVector<mlir::Value> inits{
+        isMin ? genOcta(loc, builder, 0x7FFFF00000000000ULL, 0)  // +infinity
+              : genOcta(loc, builder, 0xFFFFF00000000000ULL, 0), // -infinity
+        builder.createIntegerConstant(loc, idxTy, 0)};
+
+    auto body = [&](mlir::Location l, fir::FirOpBuilder &b, mlir::ValueRange i,
+                    mlir::ValueRange acc) -> llvm::SmallVector<mlir::Value> {
+      hlfir::Entity elem = hlfir::loadElementAt(l, b, array, i);
+      mlir::Value best = acc[0], bestPos = acc[1];
+      mlir::Value unordered;
+      mlir::Value code = genOctaCmp(l, b, elem, best, &unordered);
+      mlir::Value zeroI32 = b.createIntegerConstant(l, b.getI32Type(), 0);
+      mlir::Value better = mlir::arith::CmpIOp::create(
+          b, l,
+          isMin ? mlir::arith::CmpIPredicate::slt
+                : mlir::arith::CmpIPredicate::sgt,
+          code, zeroI32);
+      // octa_cmp reports unordered separately precisely so that it cannot be
+      // ignored by accident: a NaN yields code 0, which would read as "equal"
+      // and is not the same thing.
+      mlir::Value ordered = mlir::arith::CmpIOp::create(
+          b, l, mlir::arith::CmpIPredicate::eq, unordered, zeroI32);
+      better = mlir::arith::AndIOp::create(b, l, better, ordered);
+      mlir::Value zeroIdx = b.createIntegerConstant(l, b.getIndexType(), 0);
+      mlir::Value nothingYet = mlir::arith::CmpIOp::create(
+          b, l, mlir::arith::CmpIPredicate::eq, bestPos, zeroIdx);
+      mlir::Value take = mlir::arith::OrIOp::create(b, l, better, nothingYet);
+      return {mlir::arith::SelectOp::create(b, l, take, elem, best),
+              mlir::arith::SelectOp::create(b, l, take, i[0], bestPos)};
+    };
+
+    mlir::Value pos = hlfir::genLoopNestWithReductions(
+        loc, builder, extents, inits, body, /*isUnordered=*/false)[1];
+
+    mlir::Type resultEleTy = hlfir::getFortranElementType(operation.getType());
+    mlir::Value scalar = builder.createConvert(loc, resultEleTy, pos);
+
+    // With DIM the result of a rank-1 reduction is a scalar; without it, the
+    // standard gives a rank-1 array of one element, since its length is the
+    // rank of the argument.
+    if (mlir::isa<hlfir::ExprType>(operation.getType())) {
+      mlir::Value one = builder.createIntegerConstant(loc, idxTy, 1);
+      mlir::Value shape = builder.genShape(loc, {one});
+      hlfir::ElementalOp elemental = hlfir::genElementalOp(
+          loc, builder, resultEleTy, shape, /*typeParams=*/{},
+          [&](mlir::Location l, fir::FirOpBuilder &, mlir::ValueRange) {
+            return hlfir::Entity{scalar};
+          },
+          /*isUnordered=*/true, /*polymorphicMold=*/{}, operation.getType());
+      rewriter.replaceOp(operation, elemental.getResult());
+      return mlir::success();
+    }
+    rewriter.replaceOp(operation, scalar);
+    return mlir::success();
+  }
+
 public:
   llvm::LogicalResult
   matchAndRewrite(OP operation,
@@ -476,6 +554,25 @@ public:
       if (eleTy.isInteger(256) && !operation.getDim() && !operation.getMask())
         return genOctaReduction(operation, opName, builder, loc, array,
                                 rewriter);
+    }
+
+    // MINLOC/MAXLOC over REAL(32), rank 1 only. A rank-1 reduction is total
+    // whether or not DIM is written, so DIM=1 is accepted and only changes
+    // whether the result is a scalar; any other DIM is a partial reduction
+    // over a higher rank and still goes to the runtime, where it fails by
+    // name rather than being answered approximately here.
+    if constexpr (std::is_same_v<OP, hlfir::MinlocOp> ||
+                  std::is_same_v<OP, hlfir::MaxlocOp>) {
+      hlfir::Entity array{operation.getArray()};
+      mlir::Type eleTy = hlfir::getFortranElementType(array.getType());
+      bool dimIsOne = !operation.getDim();
+      if (mlir::Value dim = operation.getDim()) {
+        if (std::optional<llvm::APInt> c = fir::getIntIfConstant(dim))
+          dimIsOne = c->getSExtValue() == 1;
+      }
+      if (eleTy.isInteger(256) && array.getRank() == 1 && dimIsOne &&
+          !operation.getMask())
+        return genOctaMinMaxLoc(operation, builder, loc, array, rewriter);
     }
 
     mlir::Type i32 = builder.getI32Type();
@@ -561,6 +658,103 @@ struct CountOpConversion : public HlfirIntrinsicConversion<hlfir::CountOp> {
 struct MatmulOpConversion : public HlfirIntrinsicConversion<hlfir::MatmulOp> {
   using HlfirIntrinsicConversion<hlfir::MatmulOp>::HlfirIntrinsicConversion;
 
+  /// MATMUL over REAL(32), as an hlfir.elemental whose kernel contracts one
+  /// result element with a compensated loop of liboctamath calls.
+  ///
+  /// Emitted here rather than in SimplifyHLFIRIntrinsics, where the matmul
+  /// loop machinery already exists, for the reason the reductions were: that
+  /// pass runs only above -O0, and this type had a defect that was exactly a
+  /// difference between levels. MATMUL had it too, in its own form - refused
+  /// at -O0, and at -O2 the pass rewrote it into arith operations that added
+  /// bit patterns, printing 0 for a result of 4.
+  ///
+  /// The contraction compensates for the same reason SUM and DOT_PRODUCT do:
+  /// flang-rt accumulates every other real kind that way, and a REAL(32) that
+  /// added naively would be the one kind behaving differently. Each product is
+  /// a single octa_mul and so is correctly rounded on its own; what the
+  /// compensation repairs is the accumulation across the contraction.
+  ///
+  /// The three shapes of the intrinsic are handled together because they
+  /// differ only in which index is contracted:
+  ///
+  ///     (n,k) x (k,m) -> (n,m)     r(i,j) = sum_p lhs(i,p) * rhs(p,j)
+  ///     (n,k) x (k)   -> (n)       r(i)   = sum_p lhs(i,p) * rhs(p)
+  ///     (k)   x (k,m) -> (m)       r(j)   = sum_p lhs(p)   * rhs(p,j)
+  mlir::Value genOctaMatmul(fir::FirOpBuilder &builder, mlir::Location loc,
+                            hlfir::Entity lhs, hlfir::Entity rhs,
+                            mlir::Type resultType) const {
+    llvm::SmallVector<mlir::Value> lhsExtents =
+        hlfir::genExtentsVector(loc, builder, lhs);
+    llvm::SmallVector<mlir::Value> rhsExtents =
+        hlfir::genExtentsVector(loc, builder, rhs);
+    const bool lhsIsMatrix = lhs.getRank() == 2;
+    const bool rhsIsMatrix = rhs.getRank() == 2;
+
+    // The contracted extent is taken from the left operand in every form; the
+    // standard requires the two to agree, and taking it from one side rather
+    // than the shorter of the two keeps a shape mismatch a shape mismatch
+    // instead of quietly truncating the contraction.
+    mlir::Value contracted = lhsIsMatrix ? lhsExtents[1] : lhsExtents[0];
+
+    llvm::SmallVector<mlir::Value> resultExtents;
+    if (lhsIsMatrix)
+      resultExtents.push_back(lhsExtents[0]);
+    if (rhsIsMatrix)
+      resultExtents.push_back(rhsExtents[1]);
+    mlir::Value shape = builder.genShape(loc, resultExtents);
+
+    mlir::Type eleTy = builder.getIntegerType(256);
+    auto kernel = [&](mlir::Location l, fir::FirOpBuilder &b,
+                      mlir::ValueRange idx) -> hlfir::Entity {
+      llvm::SmallVector<mlir::Value> inits{genOcta(l, b, 0, 0),
+                                           genOcta(l, b, 0, 0)};
+      auto body = [&](mlir::Location bl, fir::FirOpBuilder &bb,
+                      mlir::ValueRange p,
+                      mlir::ValueRange acc) -> llvm::SmallVector<mlir::Value> {
+        llvm::SmallVector<mlir::Value> lhsIdx, rhsIdx;
+        if (lhsIsMatrix) {
+          lhsIdx = {idx[0], p[0]};
+          rhsIdx = rhsIsMatrix ? llvm::SmallVector<mlir::Value>{p[0], idx[1]}
+                               : llvm::SmallVector<mlir::Value>{p[0]};
+        } else {
+          lhsIdx = {p[0]};
+          rhsIdx = {p[0], idx[0]};
+        }
+        hlfir::Entity a = hlfir::loadElementAt(bl, bb, lhs, lhsIdx);
+        hlfir::Entity c = hlfir::loadElementAt(bl, bb, rhs, rhsIdx);
+        mlir::Value prod = genOctaBinary(bl, bb, "octa_mul", a, c);
+        mlir::Value sum = acc[0], corr = acc[1];
+        mlir::Value next = genOctaBinary(bl, bb, "octa_sub", prod, corr);
+        mlir::Value sumIfNan = genOctaBinary(bl, bb, "octa_add", sum, prod);
+        mlir::Value sumOk = genOctaBinary(bl, bb, "octa_add", sum, next);
+        mlir::Value diff = genOctaBinary(bl, bb, "octa_sub", sumOk, sum);
+        mlir::Value corrOk = genOctaBinary(bl, bb, "octa_sub", diff, next);
+        // As in SUM and DOT_PRODUCT: an Inf - Inf makes the correction NaN and
+        // would poison a sum that is otherwise well defined, so the
+        // compensation is dropped for that step rather than carried.
+        mlir::Value unordered;
+        (void)genOctaCmp(bl, bb, next, next, &unordered);
+        mlir::Value zeroI32 = bb.createIntegerConstant(bl, bb.getI32Type(), 0);
+        mlir::Value isNan = mlir::arith::CmpIOp::create(
+            bb, bl, mlir::arith::CmpIPredicate::ne, unordered, zeroI32);
+        mlir::Value zero = genOcta(bl, bb, 0, 0);
+        return {mlir::arith::SelectOp::create(bb, bl, isNan, sumIfNan, sumOk),
+                mlir::arith::SelectOp::create(bb, bl, isNan, zero, corrOk)};
+      };
+      // A zero-length contraction yields zero, which is the seed, so there is
+      // nothing to reconcile after the loop.
+      mlir::Value dot = hlfir::genLoopNestWithReductions(
+          l, b, {contracted}, inits, body, /*isUnordered=*/false)[0];
+      return hlfir::Entity{dot};
+    };
+
+    hlfir::ElementalOp elemental =
+        hlfir::genElementalOp(loc, builder, eleTy, shape, /*typeParams=*/{},
+                              kernel, /*isUnordered=*/true,
+                              /*polymorphicMold=*/{}, resultType);
+    return elemental.getResult();
+  }
+
   llvm::LogicalResult
   matchAndRewrite(hlfir::MatmulOp matmul,
                   mlir::PatternRewriter &rewriter) const override {
@@ -569,6 +763,17 @@ struct MatmulOpConversion : public HlfirIntrinsicConversion<hlfir::MatmulOp> {
 
     mlir::Value lhs = matmul.getLhs();
     mlir::Value rhs = matmul.getRhs();
+
+    // REAL(32) has no runtime kernel: the runtime's matmul is templated over a
+    // C++ element type and binary256 has none.
+    if (hlfir::getFortranElementType(matmul.getType()).isInteger(256)) {
+      mlir::Value result =
+          genOctaMatmul(builder, loc, hlfir::Entity{lhs}, hlfir::Entity{rhs},
+                        matmul.getType());
+      rewriter.replaceOp(matmul, result);
+      return mlir::success();
+    }
+
     llvm::SmallVector<IntrinsicArgument, 2> inArgs;
     inArgs.push_back({lhs, lhs.getType()});
     inArgs.push_back({rhs, rhs.getType()});
