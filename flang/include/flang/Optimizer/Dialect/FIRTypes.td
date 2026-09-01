@@ -617,9 +617,20 @@ def AnyFirComplexLike :  TypeConstraint<CPred<"::fir::isa_complex($_self)">,
 def AnyFirComplex : Type<AnyFirComplexLike.predicate,
   "any floating point complex type">;
 
+// The opaque carrier for COMPLEX(KIND=32); see fir::isa_octuple_complex.
+// Deliberately kept out of AnyFirComplexLike, so that fir.addc, fir.cmpc and
+// their relatives go on rejecting it: arithmetic on this kind is a call into
+// liboctamath, not a FIR complex operation. It belongs in AnyCompositeLike
+// below because that asks a different question - whether the value is an
+// aggregate whose parts can be inserted and extracted - and it is one.
+def AnyOctupleComplexLike : TypeConstraint<
+  CPred<"::fir::isa_octuple_complex($_self)">,
+  "the opaque carrier for COMPLEX(KIND=32)">;
+
 // Composable types
 def AnyCompositeLike : TypeConstraint<Or<[fir_RecordType.predicate,
     fir_SequenceType.predicate, AnyFirComplexLike.predicate,
+    AnyOctupleComplexLike.predicate,
     fir_VectorType.predicate, IsTupleTypePred, fir_CharacterType.predicate]>,
     "any composite">;
 

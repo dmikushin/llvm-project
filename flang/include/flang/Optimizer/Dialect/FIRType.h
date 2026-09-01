@@ -224,13 +224,42 @@ inline bool isa_complex(mlir::Type t) {
              mlir::cast<mlir::ComplexType>(t).getElementType());
 }
 
+/// Is `t` the opaque carrier for COMPLEX(KIND=32)?
+///
+/// binary256 has no MLIR float type, so REAL(32) is carried as i256 (see
+/// genRealType in ConvertType.cpp) and COMPLEX(32) as complex<i256>. This is
+/// deliberately *not* reported by isa_complex: saying otherwise would admit it
+/// to the fir.addc / fir.cmpc machinery, which casts the element type to
+/// FloatType and would then assert somewhere deeper and far less legible than
+/// here. Every operation on this type is a call into liboctamath instead,
+/// added one deliberate case at a time.
+///
+/// As with getTypeCode's i256, reading a 256-bit integer element as REAL(32)
+/// rather than as an integer of that width is unambiguous only while
+/// Fortran's widest integer kind is 16. An INTEGER(32) would make the two
+/// indistinguishable at this line.
+inline bool isa_octuple_complex(mlir::Type t) {
+  auto ct = mlir::dyn_cast<mlir::ComplexType>(t);
+  if (!ct)
+    return false;
+  auto it = mlir::dyn_cast<mlir::IntegerType>(ct.getElementType());
+  return it && it.getWidth() == 256;
+}
+
 /// Is `t` a CHARACTER type? Does not check the length.
 inline bool isa_char(mlir::Type t) { return mlir::isa<fir::CharacterType>(t); }
 
 /// Is `t` a trivial intrinsic type? CHARACTER is <em>excluded</em> because it
 /// is a dependent type.
+///
+/// COMPLEX(32) belongs here even though isa_complex excludes it: "trivial"
+/// asks whether the value can be held as an SSA value, which complex<i256>
+/// can, and not whether its parts are floats. Leaving it out made every
+/// COMPLEX(32) constant fall through to "Constant<T> was lowered to
+/// unexpected format", so the type could be declared and never given a value.
 inline bool isa_trivial(mlir::Type t) {
-  return isa_integer(t) || isa_real(t) || isa_complex(t) || isa_vector(t) ||
+  return isa_integer(t) || isa_real(t) || isa_complex(t) ||
+         isa_octuple_complex(t) || isa_vector(t) ||
          mlir::isa<fir::LogicalType>(t);
 }
 

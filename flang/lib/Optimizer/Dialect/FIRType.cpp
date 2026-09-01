@@ -569,6 +569,16 @@ int getTypeCode(mlir::Type ty, const fir::KindMapping &kindMap) {
     llvm_unreachable("unsupported real type");
   }
   if (mlir::ComplexType complexTy = mlir::dyn_cast<mlir::ComplexType>(ty)) {
+    if (auto intTy =
+            mlir::dyn_cast<mlir::IntegerType>(complexTy.getElementType())) {
+      // COMPLEX(32) is carried as complex<i256>; see fir::isa_octuple_complex.
+      // Reading a 256-bit integer element as binary256 is unambiguous only
+      // while Fortran's widest integer kind is 16 - the same condition the
+      // scalar i256 case in this function already depends on.
+      if (intTy.getWidth() == 256)
+        return CFI_type_float256_Complex;
+      llvm_unreachable("unsupported complex element type");
+    }
     mlir::FloatType floatTy =
         mlir::cast<mlir::FloatType>(complexTy.getElementType());
     if (floatTy.isBF16())

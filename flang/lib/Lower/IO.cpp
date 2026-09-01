@@ -716,6 +716,16 @@ static bool isScalarReal32(const Fortran::lower::SomeExpr *expr) {
          dt->kind() == 32;
 }
 
+/// COMPLEX(32) has the same problem and the same answer; see
+/// genOutputComplex32 below.
+static bool isScalarComplex32(const Fortran::lower::SomeExpr *expr) {
+  if (expr->Rank() != 0)
+    return false;
+  std::optional<Fortran::evaluate::DynamicType> dt = expr->GetType();
+  return dt && dt->category() == Fortran::common::TypeCategory::Complex &&
+         dt->kind() == 32;
+}
+
 /// Emit list-directed output of a scalar REAL(32) through liboctamath.
 ///
 /// The runtime cannot format this type and is not asked to. flang-rt has no
@@ -807,6 +817,102 @@ static void genOutputReal32(Fortran::lower::AbstractConverter &converter,
   ok = fir::CallOp::create(builder, loc, outputFunc, args).getResult(0);
 }
 
+/// Emit list-directed output of a scalar COMPLEX(32).
+///
+/// Same reasoning as genOutputReal32 - the runtime has no decimal conversion
+/// at 237 bits - with the parts assembled into `(re,im)` here, which is what
+/// list-directed complex output looks like. Both parts go into one buffer and
+/// one OutputPreformattedReal call rather than three calls, so the value
+/// cannot be split across records: a binary256 pair is about 160 characters
+/// and would otherwise straddle the boundary, which is exactly how the real
+/// case first came out with its exponent severed.
+static void genOutputComplex32(Fortran::lower::AbstractConverter &converter,
+                               mlir::Location loc, mlir::Value cookie,
+                               const Fortran::lower::SomeExpr *expr,
+                               Fortran::lower::StatementContext &stmtCtx,
+                               mlir::Value &ok) {
+  fir::FirOpBuilder &builder = converter.getFirOpBuilder();
+  mlir::Type i256 = builder.getIntegerType(256);
+  mlir::Type i8 = builder.getIntegerType(8);
+  mlir::Type i32 = builder.getI32Type();
+  mlir::Type i64 = builder.getI64Type();
+  mlir::Type idxTy = builder.getIndexType();
+
+  // Two values of up to 128 characters, three punctuation marks and room to
+  // spare. octa_format reports a buffer it cannot fit rather than truncating.
+  constexpr std::int64_t bufLen = 288;
+  constexpr std::int64_t partCap = 128;
+  mlir::Type bufTy = fir::SequenceType::get({bufLen}, i8);
+  mlir::Value buf = fir::AllocaOp::create(builder, loc, bufTy);
+
+  auto byteAt = [&](mlir::Value off) {
+    return fir::CoordinateOp::create(builder, loc,
+                                     fir::ReferenceType::get(i8), buf,
+                                     mlir::ValueRange{off});
+  };
+  auto putChar = [&](mlir::Value off, char c) {
+    mlir::Value ch = builder.createIntegerConstant(loc, i8, c);
+    fir::StoreOp::create(builder, loc, ch, byteAt(off));
+  };
+
+  mlir::FunctionType fmtTy = builder.getFunctionType(
+      {fir::ReferenceType::get(i8), i64, fir::ReferenceType::get(i256)}, {i32});
+  mlir::func::FuncOp fmtFunc = builder.getNamedFunction("octa_format");
+  if (!fmtFunc) {
+    fmtFunc = builder.createFunction(loc, "octa_format", fmtTy);
+    fmtFunc->setAttr(fir::FIROpsDialect::getFirRuntimeAttrName(),
+                     builder.getUnitAttr());
+  }
+  mlir::Value cap = builder.createIntegerConstant(loc, i64, partCap);
+
+  mlir::Value value = fir::getBase(converter.genExprValue(loc, expr, stmtCtx));
+  auto parts = fir::factory::Complex{builder, loc}.extractParts(value);
+
+  auto formatAt = [&](mlir::Value off, mlir::Value part) {
+    mlir::Value slot = fir::AllocaOp::create(builder, loc, i256);
+    fir::StoreOp::create(builder, loc, part, slot);
+    mlir::Value len =
+        fir::CallOp::create(builder, loc, fmtFunc,
+                            mlir::ValueRange{byteAt(off), cap, slot})
+            .getResult(0);
+    // A negative length means the value could not be formatted. Emitting
+    // nothing for it is the honest minimum here, as in the real case: a
+    // clamped zero would print a blank field that reads as a value.
+    mlir::Value zero32 = builder.createIntegerConstant(loc, i32, 0);
+    mlir::Value good = mlir::arith::CmpIOp::create(
+        builder, loc, mlir::arith::CmpIPredicate::sgt, len, zero32);
+    mlir::Value safe =
+        mlir::arith::SelectOp::create(builder, loc, good, len, zero32);
+    return builder.createConvert(loc, idxTy, safe);
+  };
+
+  mlir::Value zero = builder.createIntegerConstant(loc, idxTy, 0);
+  mlir::Value one = builder.createIntegerConstant(loc, idxTy, 1);
+  putChar(zero, '(');
+  mlir::Value reLen = formatAt(one, parts.first);
+  mlir::Value afterRe = mlir::arith::AddIOp::create(builder, loc, one, reLen);
+  putChar(afterRe, ',');
+  mlir::Value imStart =
+      mlir::arith::AddIOp::create(builder, loc, afterRe, one);
+  mlir::Value imLen = formatAt(imStart, parts.second);
+  mlir::Value afterIm =
+      mlir::arith::AddIOp::create(builder, loc, imStart, imLen);
+  putChar(afterIm, ')');
+  mlir::Value total = mlir::arith::AddIOp::create(builder, loc, afterIm, one);
+
+  mlir::Value bufPtr =
+      builder.createConvert(loc, fir::ReferenceType::get(i8), buf);
+  mlir::func::FuncOp outputFunc =
+      fir::runtime::getIORuntimeFunc<mkIOKey(OutputPreformattedReal)>(loc,
+                                                                     builder);
+  mlir::Type ptrArg = outputFunc.getFunctionType().getInput(1);
+  mlir::Type lenTy = outputFunc.getFunctionType().getInput(2);
+  llvm::SmallVector<mlir::Value> args = {
+      cookie, builder.createConvert(loc, ptrArg, bufPtr),
+      builder.createConvert(loc, lenTy, total)};
+  ok = fir::CallOp::create(builder, loc, outputFunc, args).getResult(0);
+}
+
 /// Generate a sequence of output data transfer calls.
 static void genOutputItemList(
     Fortran::lower::AbstractConverter &converter, mlir::Value cookie,
@@ -829,6 +935,10 @@ static void genOutputItemList(
       fir::emitFatalError(loc, "internal error: could not get evaluate::Expr");
     if (isFormatted && isScalarReal32(expr)) {
       genOutputReal32(converter, loc, cookie, expr, stmtCtx, ok);
+      continue;
+    }
+    if (isFormatted && isScalarComplex32(expr)) {
+      genOutputComplex32(converter, loc, cookie, expr, stmtCtx, ok);
       continue;
     }
     mlir::Type itemTy = converter.genType(*expr);

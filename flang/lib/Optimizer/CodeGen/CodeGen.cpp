@@ -1838,7 +1838,7 @@ struct EmboxCommonConversion : public fir::FIROpConversion<OP> {
         fir::getTypeCode(boxEleTy, this->lowerTy().getKindMap()));
     if (fir::isa_integer(boxEleTy) ||
         mlir::dyn_cast<fir::LogicalType>(boxEleTy) || fir::isa_real(boxEleTy) ||
-        fir::isa_complex(boxEleTy))
+        fir::isa_complex(boxEleTy) || fir::isa_octuple_complex(boxEleTy))
       return {genTypeStrideInBytes(loc, i64Ty, rewriter,
                                    this->convertType(boxEleTy), dataLayout),
               typeCodeVal};

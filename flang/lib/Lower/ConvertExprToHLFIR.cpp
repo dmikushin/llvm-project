@@ -1262,6 +1262,66 @@ GENBIN_OCTA(Subtract, "octa_sub")
 GENBIN_OCTA(Multiply, "octa_mul")
 GENBIN_OCTA(Divide, "octa_div")
 
+/// Emit a call into liboctamath for an operation on COMPLEX(32).
+///
+/// The same shape as genOctaCall above, with complex<i256> in place of i256.
+/// The library's octa_complex_t is two octa_t laid out real part first, which
+/// is what complex<i256> lowers to, so the aggregate is passed by reference
+/// without repacking.
+///
+/// COMPLEX(32) cannot use fir.addc and friends for the same reason REAL(32)
+/// cannot use arith: those operations require a floating point complex, and
+/// this one is not. See fir::isa_octuple_complex.
+static mlir::Value genOctaComplexCall(mlir::Location loc,
+                                      fir::FirOpBuilder &builder,
+                                      llvm::StringRef name,
+                                      llvm::ArrayRef<mlir::Value> args) {
+  mlir::Type cplxTy =
+      mlir::ComplexType::get(builder.getIntegerType(256));
+  mlir::Type ref = fir::ReferenceType::get(cplxTy);
+  mlir::Type i32 = builder.getI32Type();
+
+  llvm::SmallVector<mlir::Type> argTys(args.size() + 1, ref);
+  argTys.push_back(i32);
+  mlir::func::FuncOp fn =
+      builder.createFunction(loc, name, builder.getFunctionType(argTys, {i32}));
+
+  mlir::Value result = fir::AllocaOp::create(builder, loc, cplxTy);
+  llvm::SmallVector<mlir::Value> operands;
+  operands.push_back(result);
+  for (mlir::Value a : args) {
+    mlir::Value slot = fir::AllocaOp::create(builder, loc, cplxTy);
+    fir::StoreOp::create(builder, loc, a, slot);
+    operands.push_back(slot);
+  }
+  operands.push_back(builder.createIntegerConstant(loc, i32, 0));
+
+  mlir::Value status =
+      fir::CallOp::create(builder, loc, fn, operands).getResult(0);
+  fir::runtime::genRaiseOctaStatus(builder, loc, status);
+  return fir::LoadOp::create(builder, loc, result);
+}
+
+#define GENBIN_OCTA_COMPLEX(GenBinEvOp, OctaName)                              \
+  template <>                                                                  \
+  struct BinaryOp<Fortran::evaluate::GenBinEvOp<Fortran::evaluate::Type<       \
+      Fortran::common::TypeCategory::Complex, 32>>> {                          \
+    using Op = Fortran::evaluate::GenBinEvOp<Fortran::evaluate::Type<          \
+        Fortran::common::TypeCategory::Complex, 32>>;                          \
+    static hlfir::EntityWithAttributes gen(mlir::Location loc,                 \
+                                           fir::FirOpBuilder &builder,         \
+                                           const Op &, hlfir::Entity lhs,      \
+                                           hlfir::Entity rhs) {                \
+      return hlfir::EntityWithAttributes{                                      \
+          genOctaComplexCall(loc, builder, OctaName, {lhs, rhs})};             \
+    }                                                                          \
+  };
+
+GENBIN_OCTA_COMPLEX(Add, "octa_cadd")
+GENBIN_OCTA_COMPLEX(Subtract, "octa_csub")
+GENBIN_OCTA_COMPLEX(Multiply, "octa_cmul")
+GENBIN_OCTA_COMPLEX(Divide, "octa_cdiv")
+
 /// Convert to or from REAL(32).
 ///
 /// fir.convert dispatches on the MLIR type, and REAL(32) is carried as i256,
@@ -1659,6 +1719,40 @@ struct BinaryOp<Fortran::evaluate::Relational<
   }
 };
 
+/// COMPLEX(32) comparison. fir.cmpc requires a floating point complex, so the
+/// two parts are compared separately with octa_cmp and combined.
+///
+/// Fortran allows only == and /= on complex. Both are built from EQ on the
+/// parts rather than one from the negation of the other, which matters when a
+/// part is NaN: EQ is then false for that part, so the conjunction is false
+/// and /= is true, as required. Deriving == from the negation of a part-wise
+/// /= would get that backwards on exactly those operands and agree everywhere
+/// else.
+template <>
+struct BinaryOp<Fortran::evaluate::Relational<
+    Fortran::evaluate::Type<Fortran::common::TypeCategory::Complex, 32>>> {
+  using Op = Fortran::evaluate::Relational<
+      Fortran::evaluate::Type<Fortran::common::TypeCategory::Complex, 32>>;
+  static hlfir::EntityWithAttributes gen(mlir::Location loc,
+                                         fir::FirOpBuilder &builder,
+                                         const Op &op, hlfir::Entity lhs,
+                                         hlfir::Entity rhs) {
+    fir::factory::Complex helper{builder, loc};
+    auto [lre, lim] = helper.extractParts(lhs);
+    auto [rre, rim] = helper.extractParts(rhs);
+    mlir::Value reEq = genOctaCmp(
+        loc, builder, Fortran::common::RelationalOperator::EQ, lre, rre);
+    mlir::Value imEq = genOctaCmp(
+        loc, builder, Fortran::common::RelationalOperator::EQ, lim, rim);
+    mlir::Value bothEq = mlir::arith::AndIOp::create(builder, loc, reEq, imEq);
+    if (op.opr == Fortran::common::RelationalOperator::EQ)
+      return hlfir::EntityWithAttributes{bothEq};
+    mlir::Value one = builder.createIntegerConstant(loc, builder.getI1Type(), 1);
+    return hlfir::EntityWithAttributes{
+        mlir::arith::XOrIOp::create(builder, loc, bothEq, one)};
+  }
+};
+
 template <int KIND>
 struct BinaryOp<Fortran::evaluate::Relational<
     Fortran::evaluate::Type<Fortran::common::TypeCategory::Character, KIND>>> {
@@ -1911,6 +2005,40 @@ struct UnaryOp<Fortran::evaluate::Negate<
                                          fir::FirOpBuilder &builder, const Op &,
                                          hlfir::Entity lhs) {
     return hlfir::EntityWithAttributes{fir::NegcOp::create(builder, loc, lhs)};
+  }
+};
+
+/// COMPLEX(32) negation. fir.negc requires a floating point complex, and this
+/// one is complex<i256>. Both parts get octa_neg, for the reason the REAL(32)
+/// case gives: a subtraction from zero would turn -0.0 into +0.0, and for a
+/// complex that shows up in CONJG and in the branch cuts of every function
+/// that has one.
+template <>
+struct UnaryOp<Fortran::evaluate::Negate<
+    Fortran::evaluate::Type<Fortran::common::TypeCategory::Complex, 32>>> {
+  using Op = Fortran::evaluate::Negate<
+      Fortran::evaluate::Type<Fortran::common::TypeCategory::Complex, 32>>;
+  static hlfir::EntityWithAttributes gen(mlir::Location loc,
+                                         fir::FirOpBuilder &builder, const Op &,
+                                         hlfir::Entity lhs) {
+    mlir::Type i256 = builder.getIntegerType(256);
+    mlir::Type ref = fir::ReferenceType::get(i256);
+    mlir::func::FuncOp fn = builder.getNamedFunction("octa_neg");
+    if (!fn)
+      fn = builder.createFunction(loc, "octa_neg",
+                                  builder.getFunctionType({ref, ref}, {}));
+    fir::factory::Complex helper{builder, loc};
+    auto negate = [&](mlir::Value part) {
+      mlir::Value result = fir::AllocaOp::create(builder, loc, i256);
+      mlir::Value slot = fir::AllocaOp::create(builder, loc, i256);
+      fir::StoreOp::create(builder, loc, part, slot);
+      fir::CallOp::create(builder, loc, fn, mlir::ValueRange{result, slot});
+      return fir::LoadOp::create(builder, loc, result).getResult();
+    };
+    auto [re, im] = helper.extractParts(lhs);
+    mlir::Value out = helper.createComplex(lhs.getType(), negate(re),
+                                           negate(im));
+    return hlfir::EntityWithAttributes{out};
   }
 };
 

@@ -1221,6 +1221,80 @@ static mlir::Value genLibOctaCall(fir::FirOpBuilder &builder,
   return fir::LoadOp::create(builder, loc, result);
 }
 
+// Generate a call into liboctamath for a COMPLEX(32) intrinsic.
+//
+// The same shape as genLibOctaCall, differing only in which type is passed by
+// reference. `resultIsReal` covers ABS, whose result is a REAL(32) while its
+// argument is a COMPLEX(32):
+//
+//     int octa_csqrt(octa_complex_t *r, const octa_complex_t *a, int rnd);
+//     int octa_cabs (octa_t         *r, const octa_complex_t *a, int rnd);
+//
+// octa_complex_t is two octa_t with the real part first, which is what
+// complex<i256> lowers to, so no repacking is needed at the boundary.
+static mlir::Value genLibOctaComplexCallImpl(fir::FirOpBuilder &builder,
+                                             mlir::Location loc,
+                                             llvm::StringRef name,
+                                             llvm::ArrayRef<mlir::Value> args,
+                                             bool resultIsReal) {
+  mlir::Type i256 = builder.getIntegerType(256);
+  mlir::Type cplxTy = mlir::ComplexType::get(i256);
+  mlir::Type argRef = fir::ReferenceType::get(cplxTy);
+  mlir::Type resTy = resultIsReal ? i256 : cplxTy;
+  mlir::Type resRef = fir::ReferenceType::get(resTy);
+  mlir::Type i32 = builder.getI32Type();
+
+  llvm::SmallVector<mlir::Type> argTys;
+  argTys.push_back(resRef);
+  argTys.append(args.size(), argRef);
+  argTys.push_back(i32);
+
+  mlir::func::FuncOp funcOp = builder.getNamedFunction(name);
+  if (!funcOp) {
+    funcOp =
+        builder.createFunction(loc, name, builder.getFunctionType(argTys, {i32}));
+    funcOp->setAttr(fir::getSymbolAttrName(),
+                    mlir::StringAttr::get(builder.getContext(), name));
+    funcOp->setAttr(fir::FIROpsDialect::getFirRuntimeAttrName(),
+                    builder.getUnitAttr());
+  }
+
+  mlir::Value result = fir::AllocaOp::create(builder, loc, resTy);
+  llvm::SmallVector<mlir::Value> operands;
+  operands.push_back(result);
+  for (mlir::Value a : args) {
+    mlir::Value slot = fir::AllocaOp::create(builder, loc, cplxTy);
+    fir::StoreOp::create(builder, loc, a, slot);
+    operands.push_back(slot);
+  }
+  operands.push_back(builder.createIntegerConstant(loc, i32, 0));
+
+  mlir::Value status =
+      fir::CallOp::create(builder, loc, funcOp, operands).getResult(0);
+  fir::runtime::genRaiseOctaStatus(builder, loc, status);
+  return fir::LoadOp::create(builder, loc, result);
+}
+
+static mlir::Value genLibOctaComplexCall(fir::FirOpBuilder &builder,
+                                         mlir::Location loc,
+                                         const MathOperation &mathOp,
+                                         mlir::FunctionType libFuncType,
+                                         llvm::ArrayRef<mlir::Value> args) {
+  (void)libFuncType;
+  return genLibOctaComplexCallImpl(builder, loc, mathOp.runtimeFunc, args,
+                                   /*resultIsReal=*/false);
+}
+
+static mlir::Value genLibOctaCabsCall(fir::FirOpBuilder &builder,
+                                      mlir::Location loc,
+                                      const MathOperation &mathOp,
+                                      mlir::FunctionType libFuncType,
+                                      llvm::ArrayRef<mlir::Value> args) {
+  (void)libFuncType;
+  return genLibOctaComplexCallImpl(builder, loc, mathOp.runtimeFunc, args,
+                                   /*resultIsReal=*/true);
+}
+
 /// Emit `int octa_<name>(octa_t *r, const octa_t *a, const octa_t *b, int)`
 /// on two loaded binary256 values and return the loaded result.
 ///
@@ -1324,6 +1398,10 @@ constexpr auto FuncTypeComplex16Complex16Integer4 =
     genFuncType<Ty::Complex<16>, Ty::Complex<16>, Ty::Integer<4>>;
 constexpr auto FuncTypeComplex16Complex16Integer8 =
     genFuncType<Ty::Complex<16>, Ty::Complex<16>, Ty::Integer<8>>;
+constexpr auto FuncTypeReal32Complex32 =
+    genFuncType<Ty::Real<32>, Ty::Complex<32>>;
+constexpr auto FuncTypeComplex32Complex32 =
+    genFuncType<Ty::Complex<32>, Ty::Complex<32>>;
 
 static constexpr MathOperation mathOperations[] = {
     {"abs", "fabsf", genFuncType<Ty::Real<4>, Ty::Real<4>>,
@@ -1337,6 +1415,7 @@ static constexpr MathOperation mathOperations[] = {
     {"abs", "cabs", genFuncType<Ty::Real<8>, Ty::Complex<8>>,
      genComplexMathOp<mlir::complex::AbsOp>},
     {"abs", RTNAME_STRING(CAbsF128), FuncTypeReal16Complex16, genLibF128Call},
+    {"abs", "octa_cabs", FuncTypeReal32Complex32, genLibOctaCabsCall},
     {"acos", "acosf", genFuncType<Ty::Real<4>, Ty::Real<4>>,
      genMathOp<mlir::math::AcosOp>},
     {"acos", "acos", genFuncType<Ty::Real<8>, Ty::Real<8>>,
@@ -1523,6 +1602,8 @@ static constexpr MathOperation mathOperations[] = {
     {"exp", RTNAME_STRING(CExpF128), FuncTypeComplex16Complex16,
      genLibF128Call},
     {"exp", "octa_exp", FuncTypeReal32Real32, genLibOctaCall},
+    {"exp", "octa_cexp", FuncTypeComplex32Complex32,
+     genLibOctaComplexCall},
     {"feclearexcept", "feclearexcept",
      genFuncType<Ty::Integer<4>, Ty::Integer<4>>, genLibCall},
     {"fedisableexcept", "fedisableexcept",
@@ -1582,6 +1663,8 @@ static constexpr MathOperation mathOperations[] = {
     {"log", RTNAME_STRING(CLogF128), FuncTypeComplex16Complex16,
      genLibF128Call},
     {"log", "octa_log", FuncTypeReal32Real32, genLibOctaCall},
+    {"log", "octa_clog", FuncTypeComplex32Complex32,
+     genLibOctaComplexCall},
     {"log10", "log10f", genFuncType<Ty::Real<4>, Ty::Real<4>>,
      genMathOp<mlir::math::Log10Op>},
     {"log10", "log10", genFuncType<Ty::Real<8>, Ty::Real<8>>,
@@ -1729,6 +1812,8 @@ static constexpr MathOperation mathOperations[] = {
     // because mathOps.Verify() is a static_assert on it - grouping them
     // together, which reads better, does not compile.
     {"sqrt", "octa_sqrt", FuncTypeReal32Real32, genLibOctaCall},
+    {"sqrt", "octa_csqrt", FuncTypeComplex32Complex32,
+     genLibOctaComplexCall},
     {"sqrt", "csqrtf", genFuncType<Ty::Complex<4>, Ty::Complex<4>>,
      genComplexMathOp<mlir::complex::SqrtOp>},
     {"sqrt", "csqrt", genFuncType<Ty::Complex<8>, Ty::Complex<8>>,
@@ -2740,7 +2825,31 @@ mlir::Value IntrinsicLibrary::genAbs(mlir::Type resultType,
     // math::AbsFOp but it does not support all fir floating point types.
     return genRuntimeCall("abs", resultType, args);
   }
+  if (fir::isa_octuple_complex(type))
+    return genRuntimeCall("abs", resultType, args);
   if (auto intType = mlir::dyn_cast<mlir::IntegerType>(type)) {
+    if (intType.getWidth() == 256) {
+      // REAL(32) is an opaque i256, so it arrives here rather than through
+      // isa_real, and the integer path below would compute a two's complement
+      // absolute value of the bit pattern. That does not fail - it returns a
+      // plausible binary256. Measured on the branch this was found on:
+      // abs(-2.5_oct) gave 1.75, and abs(-0.0_oct) gave -0.
+      //
+      // octa_abs clears the sign bit, which is what ABS means for a real. It
+      // takes no rounding mode and returns no status, the operation being
+      // exact, so it cannot go through genLibOctaCall: that would emit a
+      // rounding argument and then read a return value that is not there.
+      mlir::Type ref = fir::ReferenceType::get(intType);
+      mlir::func::FuncOp fn = builder.getNamedFunction("octa_abs");
+      if (!fn)
+        fn = builder.createFunction(loc, "octa_abs",
+                                    builder.getFunctionType({ref, ref}, {}));
+      mlir::Value result = fir::AllocaOp::create(builder, loc, intType);
+      mlir::Value slot = fir::AllocaOp::create(builder, loc, intType);
+      fir::StoreOp::create(builder, loc, arg, slot);
+      fir::CallOp::create(builder, loc, fn, mlir::ValueRange{result, slot});
+      return fir::LoadOp::create(builder, loc, result);
+    }
     // At the time of this implementation there is no abs op in mlir.
     // So, implement abs here without branching.
     mlir::Value shift =
@@ -3740,7 +3849,26 @@ mlir::Value IntrinsicLibrary::genConjg(mlir::Type resultType,
   mlir::Value cplx = args[0];
   auto imag = fir::factory::Complex{builder, loc}.extractComplexPart(
       cplx, /*isImagPart=*/true);
-  auto negImag = mlir::arith::NegFOp::create(builder, loc, imag);
+  mlir::Value negImag;
+  if (fir::isa_octuple_complex(resultType)) {
+    // The imaginary part of a COMPLEX(32) is an opaque i256, which arith.negf
+    // will not take. octa_neg flips the sign bit; negating through a
+    // subtraction from zero would turn -0.0 into +0.0, and CONJG of a real
+    // number is exactly where that shows.
+    mlir::Type i256 = builder.getIntegerType(256);
+    mlir::Type ref = fir::ReferenceType::get(i256);
+    mlir::func::FuncOp fn = builder.getNamedFunction("octa_neg");
+    if (!fn)
+      fn = builder.createFunction(loc, "octa_neg",
+                                  builder.getFunctionType({ref, ref}, {}));
+    mlir::Value result = fir::AllocaOp::create(builder, loc, i256);
+    mlir::Value slot = fir::AllocaOp::create(builder, loc, i256);
+    fir::StoreOp::create(builder, loc, imag, slot);
+    fir::CallOp::create(builder, loc, fn, mlir::ValueRange{result, slot});
+    negImag = fir::LoadOp::create(builder, loc, result);
+  } else {
+    negImag = mlir::arith::NegFOp::create(builder, loc, imag);
+  }
   return fir::factory::Complex{builder, loc}.insertComplexPart(
       cplx, negImag, /*isImagPart=*/true);
 }

@@ -82,6 +82,21 @@ static mlir::Attribute convertToAttribute(
       return builder.getIntegerAttr(
           type, llvm::APInt(256, value.RawBits().Hexadecimal(), 16));
     }
+    if constexpr (TC == Fortran::common::TypeCategory::Complex && KIND == 32) {
+      // COMPLEX(32) is complex<i256>, so each part is an IntegerAttr over its
+      // bit pattern, for the same reason REAL(32) is one just above: the
+      // getFloatAttr lambda below asks the kind map for binary256 float
+      // semantics, which do not exist, and lowering dies in defaultRealKind.
+      mlir::Type eleTy = mlir::cast<mlir::ComplexType>(type).getElementType();
+      llvm::SmallVector<mlir::Attribute, 2> attrs = {
+          builder.getIntegerAttr(
+              eleTy,
+              llvm::APInt(256, value.REAL().RawBits().Hexadecimal(), 16)),
+          builder.getIntegerAttr(
+              eleTy,
+              llvm::APInt(256, value.AIMAG().RawBits().Hexadecimal(), 16))};
+      return builder.getArrayAttr(attrs);
+    }
     auto getFloatAttr = [&](const auto &value, mlir::Type type) {
       std::string str = value.DumpHexadecimal();
       auto floatVal =

@@ -629,7 +629,7 @@ struct ParamType {
                     k == 16 || k == 32,
                 "Unsupported real kind");
   static_assert(t != ParamTypeId::Complex || k == 2 || k == 3 || k == 4 ||
-                    k == 8 || k == 10 || k == 16,
+                    k == 8 || k == 10 || k == 16 || k == 32,
                 "Unsupported complex kind");
 
   static const ParamTypeId ty = t;
