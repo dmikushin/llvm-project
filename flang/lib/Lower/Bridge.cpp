@@ -1908,6 +1908,14 @@ private:
     }
     mlir::Type selectorType = selector.getType();
     bool realSelector = mlir::isa<mlir::FloatType>(selectorType);
+    // REAL(32) is an opaque i256, so realSelector is false for it and the
+    // integer comparisons below would decide the branch from the sign bit of
+    // a bit pattern. That is right for every value except the one where a
+    // real and its bit pattern disagree: -0.0 has the sign bit set and is
+    // equal to zero, so `if (x) 10,20,30` with x = -0.0_oct took the negative
+    // branch where the standard requires the zero branch. Nothing crashed.
+    bool octupleSelector =
+        inArithmeticIfContext && fir::isa_octuple_real(selectorType);
     assert((inArithmeticIfContext || !realSelector) && "invalid selector type");
     mlir::Value zero;
     if (inArithmeticIfContext)
@@ -1918,7 +1926,41 @@ private:
                  : builder->createIntegerConstant(loc, selectorType, 0);
     for (auto label : llvm::enumerate(labelList)) {
       mlir::Value cond;
-      if (realSelector) // inArithmeticIfContext
+      if (octupleSelector) {
+        // The all-zero bit pattern is +0.0, so the same `zero` serves; what
+        // must change is that the ordering comes from octa_cmp rather than
+        // from reading the pattern as a signed integer. Unordered is folded in
+        // so that a NaN selector takes neither branch and falls through, which
+        // is what the float path above does with OLT and OGT.
+        mlir::Type i256 = builder->getIntegerType(256);
+        mlir::Type refI256 = fir::ReferenceType::get(i256);
+        mlir::Type i32 = builder->getI32Type();
+        mlir::Type refI32 = fir::ReferenceType::get(i32);
+        mlir::func::FuncOp fn = builder->getNamedFunction("octa_cmp");
+        if (!fn)
+          fn = builder->createFunction(
+              loc, "octa_cmp",
+              builder->getFunctionType({refI256, refI256, refI32}, {i32}));
+        mlir::Value selSlot = fir::AllocaOp::create(*builder, loc, i256);
+        mlir::Value zeroSlot = fir::AllocaOp::create(*builder, loc, i256);
+        mlir::Value unordSlot = fir::AllocaOp::create(*builder, loc, i32);
+        fir::StoreOp::create(*builder, loc, selector, selSlot);
+        fir::StoreOp::create(*builder, loc, zero, zeroSlot);
+        auto call = fir::CallOp::create(
+            *builder, loc, fn,
+            mlir::ValueRange{selSlot, zeroSlot, unordSlot});
+        mlir::Value code = call.getResult(0);
+        mlir::Value unord = fir::LoadOp::create(*builder, loc, unordSlot);
+        mlir::Value i32Zero = builder->createIntegerConstant(loc, i32, 0);
+        mlir::Value isOrdered = mlir::arith::CmpIOp::create(
+            *builder, loc, mlir::arith::CmpIPredicate::eq, unord, i32Zero);
+        mlir::Value ordering = mlir::arith::CmpIOp::create(
+            *builder, loc,
+            label.index() == 0 ? mlir::arith::CmpIPredicate::slt
+                               : mlir::arith::CmpIPredicate::sgt,
+            code, i32Zero);
+        cond = mlir::arith::AndIOp::create(*builder, loc, isOrdered, ordering);
+      } else if (realSelector) // inArithmeticIfContext
         cond = mlir::arith::CmpFOp::create(
             *builder, loc,
             label.index() == 0 ? mlir::arith::CmpFPredicate::OLT

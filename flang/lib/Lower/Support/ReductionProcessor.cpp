@@ -389,6 +389,20 @@ mlir::Value ReductionProcessor::createScalarCombiner(
     mlir::Type type, mlir::Value op1, mlir::Value op2) {
   mlir::Value reductionOp;
   type = fir::unwrapRefType(type);
+
+  // REAL(32) is IEEE binary256 carried as an opaque i256. Every combiner below
+  // picks its operation with `type.isIntOrIndex()` first, which is true for
+  // that carrier, so `reduction(+:x)` over a REAL(32) added bit patterns:
+  // measured before this guard, four additions of 1.0_oct gave
+  // -2.014e78912 - the same wrong number the array SUM defect produced, and
+  // at -O0 as well as above it, so no optimisation level reported anything.
+  //
+  // Refusing rather than emitting liboctamath calls: the combiner is inlined
+  // into an OpenMP reduction region, and a plausible wrong answer there is
+  // exactly what this work exists to remove. A loud refusal is worth more.
+  if (fir::isa_octuple_real(type))
+    TODO(loc, "OpenMP reduction over REAL(KIND=32)");
+
   switch (redId) {
   case ReductionIdentifier::MAX:
     reductionOp =

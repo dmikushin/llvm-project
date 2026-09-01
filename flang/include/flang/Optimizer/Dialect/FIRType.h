@@ -246,6 +246,28 @@ inline bool isa_octuple_complex(mlir::Type t) {
   return it && it.getWidth() == 256;
 }
 
+/// Is `t` the opaque carrier for REAL(32), i.e. binary256?
+///
+/// This is the question `isa_real` cannot answer and `isa_integer` answers
+/// wrongly, and it is the single root of every REAL(32) defect found so far:
+/// conversions, list-directed output, comparison, reductions, DOT_PRODUCT,
+/// ABS, MIN/MAX, MATMUL and arithmetic IF each asked a value for its type,
+/// were told "256-bit integer", and ran the integer path on a bit pattern.
+///
+/// It exists as a name rather than as `getWidth() == 256` written out at each
+/// site so that the sites can be found. A grep for this predicate is the list
+/// of places that have considered the question; a site that has not is a site
+/// that still takes the integer branch by default, which is how all nine of
+/// them came to be silent rather than loud.
+///
+/// The same caveat as isa_octuple_complex and getTypeCode: reading a 256-bit
+/// integer as REAL(32) is unambiguous only while Fortran's widest integer
+/// kind is 16.
+inline bool isa_octuple_real(mlir::Type t) {
+  auto it = mlir::dyn_cast<mlir::IntegerType>(t);
+  return it && it.getWidth() == 256;
+}
+
 /// Is `t` a CHARACTER type? Does not check the length.
 inline bool isa_char(mlir::Type t) { return mlir::isa<fir::CharacterType>(t); }
 

@@ -1167,6 +1167,54 @@ mlir::Value genComplexMathOp(fir::FirOpBuilder &builder, mlir::Location loc,
 
 // Generate a call into liboctamath for a REAL(32) intrinsic.
 //
+// Emit `octa_cmp` on two REAL(32) values and return the ordering predicate a
+// Fortran extremum needs: `isMax ? left > right : left < right`, false when
+// the pair is unordered.
+//
+// The falseness on NaN is not incidental, it is the semantics being matched.
+// genExtremumResult's real path builds MAX as `select(left OGT right, left,
+// right)`, and OGT is false when either operand is NaN, so the right operand
+// is returned - which is what flang documents as its portable behaviour. The
+// same holds for signed zeros: octa_cmp reports -0.0 and 0.0 as equal, the
+// predicate is false, and the second zero is returned. Deriving the predicate
+// any other way, for instance as `!(left <= right)`, would agree on every
+// ordered pair and invert both of those cases.
+static mlir::Value genOctaExtremumPred(mlir::Location loc,
+                                       fir::FirOpBuilder &builder,
+                                       mlir::Value left, mlir::Value right,
+                                       bool isMax) {
+  mlir::Type i256 = builder.getIntegerType(256);
+  mlir::Type refI256 = fir::ReferenceType::get(i256);
+  mlir::Type i32 = builder.getI32Type();
+  mlir::Type refI32 = fir::ReferenceType::get(i32);
+
+  mlir::func::FuncOp fn = builder.getNamedFunction("octa_cmp");
+  if (!fn)
+    fn = builder.createFunction(
+        loc, "octa_cmp",
+        builder.getFunctionType({refI256, refI256, refI32}, {i32}));
+
+  mlir::Value leftSlot = fir::AllocaOp::create(builder, loc, i256);
+  mlir::Value rightSlot = fir::AllocaOp::create(builder, loc, i256);
+  mlir::Value unordSlot = fir::AllocaOp::create(builder, loc, i32);
+  fir::StoreOp::create(builder, loc, left, leftSlot);
+  fir::StoreOp::create(builder, loc, right, rightSlot);
+
+  auto call = fir::CallOp::create(
+      builder, loc, fn, mlir::ValueRange{leftSlot, rightSlot, unordSlot});
+  mlir::Value code = call.getResult(0);
+  mlir::Value unord = fir::LoadOp::create(builder, loc, unordSlot);
+
+  mlir::Value zero = builder.createIntegerConstant(loc, i32, 0);
+  mlir::Value isOrdered = mlir::arith::CmpIOp::create(
+      builder, loc, mlir::arith::CmpIPredicate::eq, unord, zero);
+  mlir::Value ordering = mlir::arith::CmpIOp::create(
+      builder, loc,
+      isMax ? mlir::arith::CmpIPredicate::sgt : mlir::arith::CmpIPredicate::slt,
+      code, zero);
+  return mlir::arith::AndIOp::create(builder, loc, isOrdered, ordering);
+}
+
 // This is the octuple analogue of genLibF128Call and it cannot reuse it. The
 // F128 entry points take and return values; liboctamath takes and returns
 // binary256 by pointer and returns an IEEE status word instead:
@@ -9349,6 +9397,19 @@ static mlir::Value genExtremumResult(mlir::Location loc,
     }
 
     llvm_unreachable("unsupported FPMaxminBehavior");
+  } else if (fir::isa_octuple_real(type)) {
+    // REAL(32) is an opaque i256, so isa_real above is false for it and the
+    // integer branch below would run arith.maxsi/minsi on bit patterns.
+    //
+    // That does not fail and is not even wrong everywhere, which is why it
+    // survived: IEEE ordering agrees with signed integer ordering while both
+    // operands are non-negative, so the defect appears only once both are
+    // negative, where the magnitudes invert. Measured on the branch this was
+    // found on: max(-2.0_oct, -5.0_oct) gave -5 and min gave -2, while
+    // max(-1.0_oct, 2.0_oct) was correct. A probe with mixed signs passes and
+    // reports nothing.
+    mlir::Value pred = genOctaExtremumPred(loc, builder, left, right, isMax);
+    return mlir::arith::SelectOp::create(builder, loc, pred, left, right);
   } else if (fir::isa_integer(type)) {
     // It is probably okay to use signed index.maxs/mins, but
     // maybe the caller needs to specify signedness.

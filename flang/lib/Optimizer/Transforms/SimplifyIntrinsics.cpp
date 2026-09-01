@@ -1275,6 +1275,53 @@ void SimplifyIntrinsicsPass::runOnOperation() {
         return;
       if (mlir::SymbolRefAttr callee = call.getCalleeAttr()) {
         mlir::StringRef funcName = callee.getLeafReference().getValue();
+
+        // Every simplification below rebuilds the reduction out of arith
+        // operations chosen by the element type. REAL(32) is IEEE binary256
+        // carried as an opaque i256, so each of them would pick the *integer*
+        // operation and compute on bit patterns.
+        //
+        // The guard sits here, once, rather than in each simplification,
+        // because this walk is the single entry to the pass and because the
+        // list below grows. It is also the only thing standing between this
+        // pass and a wrong answer that appears at -O1: the pass is gated on
+        // OptLevel != O0 in Pipelines.cpp, so anything it mishandles is
+        // correct at the level people develop at and wrong at the level they
+        // ship. MINLOC did not even get that far - it asserted in
+        // APInt::getSExtValue, because a binary256 seed does not fit an
+        // int64_t.
+        for (mlir::Value arg : call.getArgs()) {
+          // The element type is not visible on the argument itself: by the
+          // time it reaches the runtime call it has been converted to
+          // fir.box<none>, which has erased it. So walk back through the
+          // fir.convert chain, as getArgElementType does.
+          //
+          // This is not a call to getArgElementType, deliberately. That helper
+          // casts the convert's operand to fir::BoxType, which holds for the
+          // arguments it was written for and asserts on the others; asking
+          // every argument of every call is a wider question than it was built
+          // to answer, and the first version of this guard crashed the
+          // compiler at -O2 for exactly that reason.
+          mlir::Value val = arg;
+          for (unsigned hops = 0; hops < 8; ++hops) {
+            mlir::Operation *defOp = val.getDefiningOp();
+            auto conv = mlir::dyn_cast_or_null<fir::ConvertOp>(defOp);
+            if (!conv)
+              break;
+            val = conv.getOperand();
+            mlir::Type ty = val.getType();
+            if (auto boxTy = mlir::dyn_cast<fir::BaseBoxType>(ty)) {
+              mlir::Type eleTy = fir::unwrapSeqOrBoxedSeqType(boxTy);
+              if (eleTy && eleTy.isInteger(256)) {
+                LLVM_DEBUG(llvm::dbgs()
+                           << "Skipping " << funcName
+                           << ": REAL(32) is an opaque i256, not an integer\n");
+                return;
+              }
+            }
+          }
+        }
+
         // Replace call to runtime function for SUM when it has single
         // argument (no dim or mask argument) for 1D arrays with either
         // Integer4 or Real8 types. Other forms are ignored.

@@ -2661,6 +2661,24 @@ public:
     fir::FirOpBuilder builder{rewriter, matmul.getOperation()};
     hlfir::Entity lhs = hlfir::Entity{matmul.getLhs()};
     hlfir::Entity rhs = hlfir::Entity{matmul.getRhs()};
+
+    // The same refusal ReductionAsElementalConverter carries, for the same
+    // reason, in a class that does not inherit it: this is a plain
+    // OpRewritePattern, so the guard added there for SUM and PRODUCT never
+    // covered MATMUL.
+    //
+    // genAccumulateProduct dispatches on the element type, and REAL(32) is an
+    // opaque i256, so it emits arith.addi and arith.muli over bit patterns.
+    // Measured before this: matmul of two 2x2 arrays of 1.0 and 2.0 refused to
+    // compile at -O0 with "unsupported type in MATMUL" and printed 0 at -O2.
+    // Loud at the level people develop at, silently wrong at the level they
+    // ship, which is the worst of the three outcomes and the one this removes.
+    if (mlir::cast<hlfir::ExprType>(matmul.getType())
+            .getElementType()
+            .isInteger(256))
+      return rewriter.notifyMatchFailure(
+          matmul, "REAL(32) is an opaque i256; arith cannot accumulate it");
+
     mlir::Value resultShape, innerProductExtent;
     std::tie(resultShape, innerProductExtent) =
         genResultShape(loc, builder, lhs, rhs);
