@@ -646,28 +646,37 @@ protected:
   /// MINLOC/MAXLOC over a rank-1 REAL(32) array, as a loop of liboctamath
   /// calls carrying both the best value and its position.
   ///
-  /// Ties go to the first occurrence, which the standard requires, and which
-  /// falls out of comparing strictly: a later equal element gives code 0 and
-  /// is not taken. That is worth stating because the non-strict form is the
-  /// natural thing to write and is wrong only on inputs with a repeat.
+  /// Without BACK, ties go to the first occurrence, which falls out of
+  /// comparing strictly: a later equal element gives code 0 and is not taken.
+  /// With BACK they go to the last, so the comparison becomes non-strict and
+  /// an equal element displaces the one before it. That is the whole of BACK,
+  /// and writing it this way rather than by scanning backwards matters: the
+  /// backwards scan changes which element first establishes the running
+  /// extremum, and so changes the answer for NaN and for masked elements,
+  /// which BACK is not supposed to touch. Because it is a select on a value
+  /// rather than a branch, a BACK that is only known at run time costs the
+  /// same as a constant one.
   ///
   /// The seed position is 0, and an element is taken when the position is
-  /// still 0 regardless of the comparison. That gives the standard's answer
-  /// for an empty array - zero, since the loop never runs - without a second
-  /// reconciliation step, and it decides the NaN case: a NaN never compares
-  /// better, so it is selected only when it is the first element and nothing
-  /// ordered ever displaces it. The same seed gives the standard's answer for
-  /// an array every element of which is masked out: nothing is ever taken, so
-  /// every subscript stays zero.
+  /// still 0 and the element is ordered. That gives the standard's answer for
+  /// an empty array - zero, since the loop never runs - without a second
+  /// reconciliation step, and the same seed gives zero for an array every
+  /// element of which is masked out. The ordered gate is what keeps a NaN out:
+  /// without it the first element seeds unconditionally, and because every
+  /// later comparison against a NaN is unordered, nothing displaces it.
   ///
   /// For rank n the accumulator carries n positions beside the value, and the
   /// result is a rank-1 array of those n subscripts. "First occurrence" is in
   /// array element order, which is what the loop nest already produces:
   /// hlfir::genLoopNestWithReductions builds from the last extent outwards, so
   /// the innermost loop drives the first subscript, and that is column-major.
+  /// BACK reverses which of two equal elements wins in that same order, so it
+  /// needs nothing extra for rank n - the rank-2 case where the two extrema
+  /// sit at (2,1) and (1,2) is the one that would expose a scan written
+  /// backwards instead.
   llvm::LogicalResult genOctaMinMaxLoc(OP operation, fir::FirOpBuilder &builder,
                                        mlir::Location loc, hlfir::Entity array,
-                                       mlir::Value mask,
+                                       mlir::Value mask, mlir::Value back,
                                        mlir::PatternRewriter &rewriter) const {
     constexpr bool isMin = std::is_same_v<OP, hlfir::MinlocOp>;
     llvm::SmallVector<mlir::Value> extents =
@@ -708,6 +717,18 @@ protected:
           isMin ? mlir::arith::CmpIPredicate::slt
                 : mlir::arith::CmpIPredicate::sgt,
           code, zeroI32);
+      // BACK makes the comparison non-strict, so an element equal to the
+      // running extremum displaces it and the last occurrence survives. It is
+      // folded into the predicate rather than reversing the loop, because the
+      // loop order also decides which element seeds the accumulator, and BACK
+      // must not move that.
+      if (back) {
+        mlir::Value backBit = b.createConvert(l, b.getI1Type(), back);
+        mlir::Value tie = mlir::arith::CmpIOp::create(
+            b, l, mlir::arith::CmpIPredicate::eq, code, zeroI32);
+        better = mlir::arith::OrIOp::create(
+            b, l, better, mlir::arith::AndIOp::create(b, l, backBit, tie));
+      }
       // octa_cmp reports unordered separately precisely so that it cannot be
       // ignored by accident: a NaN yields code 0, which would read as "equal"
       // and is not the same thing.
@@ -717,6 +738,14 @@ protected:
       mlir::Value zIdx = b.createIntegerConstant(l, b.getIndexType(), 0);
       mlir::Value nothingYet = mlir::arith::CmpIOp::create(
           b, l, mlir::arith::CmpIPredicate::eq, acc[1], zIdx);
+      // Seeding is gated on the element being ordered, so a NaN cannot become
+      // the running extremum merely by arriving first. Without this the seed
+      // arm takes element one unconditionally, and since every later
+      // comparison against a NaN is unordered, nothing ever displaces it:
+      // maxloc([NaN,4,7,7]) returned 1 where every other kind returns 3.
+      // A NaN is unordered with the +/-infinity seed, so this costs nothing
+      // for an array that has none.
+      nothingYet = mlir::arith::AndIOp::create(b, l, nothingYet, ordered);
       mlir::Value take = mlir::arith::OrIOp::create(b, l, better, nothingYet);
       // The mask gates the whole decision, including the "nothing yet" arm:
       // a masked-out element must not be taken merely because it came first,
@@ -875,8 +904,20 @@ public:
         maskOk = !m.isBoxAddressOrValue() && !m.isPolymorphic() &&
                  (m.isScalar() || m.getRank() == array.getRank());
       }
-      if (eleTy.isInteger(256) && dimOk && maskOk)
-        return genOctaMinMaxLoc(operation, builder, loc, array, mask, rewriter);
+      // BACK is read as a value, so a boxed one - which may be an absent
+      // optional - is refused here rather than dereferenced. It reaches the
+      // runtime and fails by name, which is where the other unhandled shapes
+      // of this intrinsic already go.
+      mlir::Value back = operation.getBack();
+      bool backOk = true;
+      if (back) {
+        hlfir::Entity bk{back};
+        backOk = !bk.isBoxAddressOrValue() && !bk.isPolymorphic() &&
+                 bk.isScalar();
+      }
+      if (eleTy.isInteger(256) && dimOk && maskOk && backOk)
+        return genOctaMinMaxLoc(operation, builder, loc, array, mask, back,
+                                rewriter);
     }
 
     mlir::Type i32 = builder.getI32Type();
