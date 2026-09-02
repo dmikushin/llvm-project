@@ -33,6 +33,7 @@
 #include "flang/Optimizer/Builder/Todo.h"
 #include "flang/Optimizer/Dialect/FIRAttr.h"
 #include "flang/Optimizer/HLFIR/HLFIROps.h"
+#include "mlir/Dialect/OpenMP/OpenMPDialect.h"
 #include "mlir/IR/IRMapping.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
@@ -1238,9 +1239,38 @@ static mlir::Value genOctaCall(mlir::Location loc, fir::FirOpBuilder &builder,
   // the library instead would undo a deliberate decision of its interface,
   // which returns flags per call precisely so that a caller is never handed
   // someone else's history.
+  //
+  // Except inside an omp.atomic.update region, where raising them is both
+  // impossible and wrong.
+  //
+  // Impossible: genRaiseOctaStatus guards the raise with a fir.if, which is a
+  // single operation at FIR level but becomes real control flow when FIR is
+  // lowered to a CFG. omp.atomic.update requires its region to hold one block,
+  // so the verifier rejected it after that pass - "expects region #0 to have
+  // 0 or 1 blocks" - and every REAL(32) atomic update failed to compile.
+  //
+  // Wrong: that region is the body of a compare-exchange loop. It runs once
+  // per attempt and every attempt but the last is discarded, so flags raised
+  // here would report exceptions from arithmetic that never took effect. A
+  // program calling IEEE_GET_FLAG afterwards would see INEXACT from a
+  // speculative attempt under contention and not under none - the same
+  // program, the same data, an answer that depends on scheduling.
+  //
+  // So the flags of the surviving attempt are lost rather than mis-reported.
+  // That is a real loss and it is recorded in audit/README.md; reporting a
+  // race as an IEEE exception would be worse.
   mlir::Value status =
       fir::CallOp::create(builder, loc, fn, operands).getResult(0);
-  fir::runtime::genRaiseOctaStatus(builder, loc, status);
+  // The enclosing operation must be tested as well as its ancestors: when the
+  // update expression is generated directly into the region, getParentOp() is
+  // the AtomicUpdateOp itself, and getParentOfType would start looking above
+  // it and find nothing.
+  mlir::Operation *enclosing = builder.getBlock()->getParentOp();
+  bool inAtomicUpdate =
+      enclosing && (mlir::isa<mlir::omp::AtomicUpdateOp>(enclosing) ||
+                    enclosing->getParentOfType<mlir::omp::AtomicUpdateOp>());
+  if (!inAtomicUpdate)
+    fir::runtime::genRaiseOctaStatus(builder, loc, status);
   return fir::LoadOp::create(builder, loc, result);
 }
 
