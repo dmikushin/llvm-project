@@ -8,6 +8,7 @@
 
 #include "flang/Optimizer/Builder/Runtime/Exceptions.h"
 #include "flang/Optimizer/Builder/FIRBuilder.h"
+#include "flang/Optimizer/Builder/LowLevelIntrinsics.h"
 #include "flang/Optimizer/Builder/Runtime/RTBuilder.h"
 #include "flang/Runtime/exceptions.h"
 
@@ -139,4 +140,37 @@ void fir::runtime::genRaiseOctaStatus(fir::FirOpBuilder &builder,
         genFeraiseexcept(builder, loc, genMapExcept(builder, loc, flags));
       })
       .end();
+}
+
+mlir::Value fir::runtime::genOctaRoundingMode(fir::FirOpBuilder &builder,
+                                              mlir::Location loc,
+                                              mlir::Value mode) {
+  mlir::Type i32 = builder.getI32Type();
+  auto k = [&](int v) { return builder.createIntegerConstant(loc, i32, v); };
+  auto eq = [&](int v) {
+    return mlir::arith::CmpIOp::create(
+        builder, loc, mlir::arith::CmpIPredicate::eq, mode, k(v));
+  };
+  mlir::Value r = k(0); // nearest, ties to even
+  r = mlir::arith::SelectOp::create(builder, loc, eq(0), k(1), r);
+  r = mlir::arith::SelectOp::create(builder, loc, eq(2), k(3), r);
+  r = mlir::arith::SelectOp::create(builder, loc, eq(3), k(2), r);
+  r = mlir::arith::SelectOp::create(builder, loc, eq(4), k(4), r);
+  return r;
+}
+
+mlir::Value
+fir::runtime::genOctaCurrentRoundingMode(fir::FirOpBuilder &builder,
+                                         mlir::Location loc) {
+  // Read per call rather than hoisted. IEEE_SET_ROUNDING_MODE can be called
+  // between any two operations, including inside a procedure this one calls,
+  // so a value cached across a region would be answering an older question.
+  // llvm.get.rounding is a register read and the surrounding call into the
+  // library costs orders of magnitude more, so there is nothing here worth
+  // trading correctness for.
+  mlir::Value mode =
+      fir::CallOp::create(builder, loc,
+                          fir::factory::getLlvmGetRounding(builder))
+          .getResult(0);
+  return genOctaRoundingMode(builder, loc, mode);
 }

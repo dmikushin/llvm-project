@@ -1225,9 +1225,11 @@ static mlir::Value genOctaCall(mlir::Location loc, fir::FirOpBuilder &builder,
     fir::StoreOp::create(builder, loc, a, slot);
     operands.push_back(slot);
   }
-  // OCTA_RND_NEAREST_EVEN. Fortran has no way to select another mode for an
-  // ordinary expression, and IEEE_SET_ROUNDING_MODE is not wired up here.
-  operands.push_back(builder.createIntegerConstant(loc, i32, 0));
+  // The rounding mode in force, read per operation. Hardware kinds obey the
+  // FPU control word without being told; this library takes the mode as an
+  // argument, so passing a constant made IEEE_SET_ROUNDING_MODE ineffective
+  // for REAL(32) alone - and silently, which is the part that mattered.
+  operands.push_back(fir::runtime::genOctaCurrentRoundingMode(builder, loc));
 
   // The library reports IEEE flags per call rather than accumulating them, so
   // they are raised into the hardware status word here - that is where

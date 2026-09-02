@@ -65,5 +65,27 @@ mlir::Value genGetStatusTypeSize(fir::FirOpBuilder &builder,
 void genRaiseOctaStatus(fir::FirOpBuilder &builder, mlir::Location loc,
                         mlir::Value status);
 
+/// Translate a rounding mode from flang's encoding into liboctamath's.
+///
+/// flang uses llvm.get.rounding's numbering, which is also what
+/// magic-numbers.h gives IEEE_ROUND_TYPE: 0 to-zero, 1 nearest, 2 up, 3 down,
+/// 4 away. liboctamath numbers them 0 nearest-even, 1 zero, 2 down, 3 up,
+/// 4 nearest-away. The first four disagree pairwise, so this is a translation
+/// and emphatically not a cast: passing one encoding as the other silently
+/// swaps to-zero with nearest and up with down.
+mlir::Value genOctaRoundingMode(fir::FirOpBuilder &builder, mlir::Location loc,
+                                mlir::Value mode);
+
+/// The rounding mode in force right now, in liboctamath's encoding.
+///
+/// Hardware kinds obey the FPU control word, so their arithmetic passes
+/// nothing. REAL(32) is computed by a library that takes the mode per call, so
+/// every call site has to read it. Emitting a constant instead makes
+/// IEEE_SET_ROUNDING_MODE silently ineffective for this kind alone - measured:
+/// under IEEE_UP and then IEEE_DOWN, 1/3 compared equal at REAL(32) while
+/// REAL(8) correctly differed.
+mlir::Value genOctaCurrentRoundingMode(fir::FirOpBuilder &builder,
+                                       mlir::Location loc);
+
 } // namespace fir::runtime
 #endif // FORTRAN_OPTIMIZER_BUILDER_RUNTIME_EXCEPTIONS_H

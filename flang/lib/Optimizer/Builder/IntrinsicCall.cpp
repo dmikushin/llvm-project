@@ -1256,8 +1256,10 @@ static mlir::Value genLibOctaCall(fir::FirOpBuilder &builder,
     fir::StoreOp::create(builder, loc, a, slot);
     operands.push_back(slot);
   }
-  // OCTA_RND_NEAREST_EVEN.
-  operands.push_back(builder.createIntegerConstant(loc, i32, 0));
+  // The rounding mode in force, not a constant: this library takes the mode
+  // per call, so a constant here would make IEEE_SET_ROUNDING_MODE ineffective
+  // for REAL(32) alone and say nothing about it.
+  operands.push_back(fir::runtime::genOctaCurrentRoundingMode(builder, loc));
 
   // The status word goes to the hardware flags, so IEEE_GET_FLAG sees the
   // exceptions an intrinsic raised. See genRaiseOctaStatus for what does not
@@ -1605,26 +1607,13 @@ static mlir::Value genOctaModel(fir::FirOpBuilder &builder, mlir::Location loc,
 
 /// Translate flang's rounding-mode encoding into octa_rnd_t.
 ///
-/// flang uses llvm.get.rounding's numbering, which is also what
-/// magic-numbers.h gives IEEE_ROUND_TYPE: 0 to-zero, 1 nearest, 2 up, 3 down,
-/// 4 away. liboctamath numbers them 0 nearest-even, 1 zero, 2 down, 3 up,
-/// 4 nearest-away. The first four disagree pairwise, so this is a translation
-/// and emphatically not a cast; passing one encoding as the other silently
-/// swaps to-zero with nearest and up with down.
+/// The translation itself lives in fir::runtime beside genRaiseOctaStatus,
+/// because the arithmetic lowering in ConvertExprToHLFIR.cpp needs the same
+/// mapping and two copies of it could disagree - which for these two
+/// encodings means silently swapping up with down.
 static mlir::Value genOctaRoundingMode(fir::FirOpBuilder &builder,
                                        mlir::Location loc, mlir::Value mode) {
-  mlir::Type i32 = builder.getI32Type();
-  auto k = [&](int v) { return builder.createIntegerConstant(loc, i32, v); };
-  auto eq = [&](int v) {
-    return mlir::arith::CmpIOp::create(
-        builder, loc, mlir::arith::CmpIPredicate::eq, mode, k(v));
-  };
-  mlir::Value r = k(0); // nearest, ties to even
-  r = mlir::arith::SelectOp::create(builder, loc, eq(0), k(1), r);
-  r = mlir::arith::SelectOp::create(builder, loc, eq(2), k(3), r);
-  r = mlir::arith::SelectOp::create(builder, loc, eq(3), k(2), r);
-  r = mlir::arith::SelectOp::create(builder, loc, eq(4), k(4), r);
-  return r;
+  return fir::runtime::genOctaRoundingMode(builder, loc, mode);
 }
 
 /// IEEE_RINT on a REAL(32), under a mode in flang's encoding.
