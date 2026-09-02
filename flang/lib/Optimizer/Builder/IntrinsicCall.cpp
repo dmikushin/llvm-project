@@ -1603,6 +1603,69 @@ static mlir::Value genOctaModel(fir::FirOpBuilder &builder, mlir::Location loc,
   return fir::LoadOp::create(builder, loc, result);
 }
 
+/// Translate flang's rounding-mode encoding into octa_rnd_t.
+///
+/// flang uses llvm.get.rounding's numbering, which is also what
+/// magic-numbers.h gives IEEE_ROUND_TYPE: 0 to-zero, 1 nearest, 2 up, 3 down,
+/// 4 away. liboctamath numbers them 0 nearest-even, 1 zero, 2 down, 3 up,
+/// 4 nearest-away. The first four disagree pairwise, so this is a translation
+/// and emphatically not a cast; passing one encoding as the other silently
+/// swaps to-zero with nearest and up with down.
+static mlir::Value genOctaRoundingMode(fir::FirOpBuilder &builder,
+                                       mlir::Location loc, mlir::Value mode) {
+  mlir::Type i32 = builder.getI32Type();
+  auto k = [&](int v) { return builder.createIntegerConstant(loc, i32, v); };
+  auto eq = [&](int v) {
+    return mlir::arith::CmpIOp::create(
+        builder, loc, mlir::arith::CmpIPredicate::eq, mode, k(v));
+  };
+  mlir::Value r = k(0); // nearest, ties to even
+  r = mlir::arith::SelectOp::create(builder, loc, eq(0), k(1), r);
+  r = mlir::arith::SelectOp::create(builder, loc, eq(2), k(3), r);
+  r = mlir::arith::SelectOp::create(builder, loc, eq(3), k(2), r);
+  r = mlir::arith::SelectOp::create(builder, loc, eq(4), k(4), r);
+  return r;
+}
+
+/// IEEE_RINT on a REAL(32), under a mode in flang's encoding.
+static mlir::Value genOctaRint(fir::FirOpBuilder &builder, mlir::Location loc,
+                               mlir::Value x, mlir::Value mode) {
+  return genOctaModel(builder, loc, "octa_rint", x,
+                      genOctaRoundingMode(builder, loc, mode));
+}
+
+/// Call a liboctamath entry point of the shape
+///
+///     int octa_f(octa_t *r, const octa_t *a, const octa_t *b);
+///
+/// - two binary256 operands, no rounding mode, because the operation is exact.
+/// genOctaModel next door takes one operand and an optional `int`, and
+/// genLibOctaCall takes a rounding mode; neither fits an exact binary.
+static mlir::Value genOctaExactBinary(fir::FirOpBuilder &builder,
+                                      mlir::Location loc, llvm::StringRef name,
+                                      mlir::Value a, mlir::Value b) {
+  mlir::Type i256 = builder.getIntegerType(256);
+  mlir::Type i32 = builder.getI32Type();
+  mlir::Type ref = fir::ReferenceType::get(i256);
+
+  mlir::func::FuncOp fn = builder.getNamedFunction(name);
+  if (!fn)
+    fn = builder.createFunction(
+        loc, name, builder.getFunctionType({ref, ref, ref}, {i32}));
+
+  mlir::Value result = fir::AllocaOp::create(builder, loc, i256);
+  mlir::Value aSlot = fir::AllocaOp::create(builder, loc, i256);
+  mlir::Value bSlot = fir::AllocaOp::create(builder, loc, i256);
+  fir::StoreOp::create(builder, loc, a, aSlot);
+  fir::StoreOp::create(builder, loc, b, bSlot);
+  mlir::Value status =
+      fir::CallOp::create(builder, loc, fn,
+                          mlir::ValueRange{result, aSlot, bSlot})
+          .getResult(0);
+  fir::runtime::genRaiseOctaStatus(builder, loc, status);
+  return fir::LoadOp::create(builder, loc, result);
+}
+
 /// A binary256 zero.
 static mlir::Value genOctaZero(fir::FirOpBuilder &builder, mlir::Location loc) {
   mlir::Type i256 = builder.getIntegerType(256);
@@ -1655,6 +1718,154 @@ static mlir::Value genOctaCmp(fir::FirOpBuilder &builder, mlir::Location loc,
   mlir::Value ordering =
       mlir::arith::CmpIOp::create(builder, loc, pred, code, zero);
   return mlir::arith::AndIOp::create(builder, loc, isOrdered, ordering);
+}
+
+/// Evaluate an ordered floating-point predicate on two REAL(32) values.
+///
+/// The six IEEE comparison generics are written in terms of
+/// arith::CmpFPredicate, which an i256 cannot use. octa_cmp supplies the
+/// ordering and reports unorderedness separately, so each predicate is that
+/// ordering under an integer predicate - except UNE, which is true exactly
+/// when the pair is NOT ordered-and-equal, and so is the negation rather than
+/// a predicate of its own.
+static mlir::Value genOctaComparePred(fir::FirOpBuilder &builder,
+                                      mlir::Location loc,
+                                      mlir::arith::CmpFPredicate pred,
+                                      mlir::Value a, mlir::Value b) {
+  if (pred == mlir::arith::CmpFPredicate::UNE) {
+    mlir::Value eq =
+        genOctaCmp(builder, loc, a, b, mlir::arith::CmpIPredicate::eq);
+    return mlir::arith::XOrIOp::create(builder, loc, eq,
+                                       builder.createBool(loc, true));
+  }
+  mlir::arith::CmpIPredicate ip;
+  switch (pred) {
+  case mlir::arith::CmpFPredicate::OEQ:
+    ip = mlir::arith::CmpIPredicate::eq;
+    break;
+  case mlir::arith::CmpFPredicate::OGE:
+    ip = mlir::arith::CmpIPredicate::sge;
+    break;
+  case mlir::arith::CmpFPredicate::OGT:
+    ip = mlir::arith::CmpIPredicate::sgt;
+    break;
+  case mlir::arith::CmpFPredicate::OLE:
+    ip = mlir::arith::CmpIPredicate::sle;
+    break;
+  case mlir::arith::CmpFPredicate::OLT:
+    ip = mlir::arith::CmpIPredicate::slt;
+    break;
+  default:
+    llvm_unreachable("unexpected IEEE comparison predicate for REAL(32)");
+  }
+  return genOctaCmp(builder, loc, a, b, ip);
+}
+
+/// True when TYPE is the opaque 256-bit value REAL(32) is lowered as.
+///
+/// REAL(32) has no MLIR float type; it travels as an i256 holding the IEEE
+/// binary256 interchange encoding. Every subsystem that dispatches on type has
+/// to be told about it, and this is the predicate they ask.
+static bool isOctaType(mlir::Type type) {
+  auto intTy = mlir::dyn_cast<mlir::IntegerType>(type);
+  return intTy && intTy.getWidth() == 256;
+}
+
+/// binary256 field geometry: sign at bit 255, a 19-bit biased exponent at
+/// 254..236, and a 236-bit trailing significand at 235..0. The same layout is
+/// assumed by genOctaOne above, which puts the bias 0x3FFFF at bits 62..44 of
+/// the top word.
+static constexpr unsigned octaFracBits = 236;
+static constexpr unsigned octaExpMax = 0x7FFFF; // 19 ones: Inf/NaN exponent
+
+static mlir::Value genOctaConstant(fir::FirOpBuilder &builder,
+                                   mlir::Location loc, const llvm::APInt &v) {
+  mlir::Type i256 = builder.getIntegerType(256);
+  return mlir::arith::ConstantOp::create(builder, loc, i256,
+                                         builder.getIntegerAttr(i256, v));
+}
+
+/// Classify a binary256 bit pattern and test it against one of the ten-bit
+/// masks (finiteTest, nanTest, ...) that genIsFPClass uses for hardware kinds.
+///
+/// Doing the classification here rather than in liboctamath keeps it a handful
+/// of integer ops with no call and no rounding: the class of a value is a
+/// property of its encoding, so there is nothing for a library to add.
+static mlir::Value genOctaIsFPClass(fir::FirOpBuilder &builder,
+                                    mlir::Location loc, mlir::Value x,
+                                    int fpclass) {
+  mlir::Type i256 = builder.getIntegerType(256);
+  mlir::Type i32 = builder.getI32Type();
+  auto cmp = [&](mlir::arith::CmpIPredicate p, mlir::Value a, mlir::Value b) {
+    return mlir::arith::CmpIOp::create(builder, loc, p, a, b);
+  };
+  mlir::Value zero256 = genOctaConstant(builder, loc, llvm::APInt(256, 0));
+
+  // sign: the whole word read as signed is negative exactly when bit 255 is set
+  mlir::Value isNeg = cmp(mlir::arith::CmpIPredicate::slt, x, zero256);
+
+  llvm::APInt fracMaskV = llvm::APInt::getLowBitsSet(256, octaFracBits);
+  mlir::Value frac = mlir::arith::AndIOp::create(
+      builder, loc, x, genOctaConstant(builder, loc, fracMaskV));
+  mlir::Value fracZero = cmp(mlir::arith::CmpIPredicate::eq, frac, zero256);
+
+  mlir::Value shifted = mlir::arith::ShRUIOp::create(
+      builder, loc, x,
+      genOctaConstant(builder, loc, llvm::APInt(256, octaFracBits)));
+  mlir::Value exp = mlir::arith::AndIOp::create(
+      builder, loc, shifted,
+      genOctaConstant(builder, loc, llvm::APInt(256, octaExpMax)));
+  mlir::Value expZero = cmp(mlir::arith::CmpIPredicate::eq, exp, zero256);
+  mlir::Value expOnes =
+      cmp(mlir::arith::CmpIPredicate::eq, exp,
+          genOctaConstant(builder, loc, llvm::APInt(256, octaExpMax)));
+
+  // The quiet bit is the most significant bit of the trailing significand.
+  mlir::Value quietMask = genOctaConstant(
+      builder, loc, llvm::APInt::getOneBitSet(256, octaFracBits - 1));
+  mlir::Value quiet =
+      cmp(mlir::arith::CmpIPredicate::ne,
+          mlir::arith::AndIOp::create(builder, loc, x, quietMask), zero256);
+
+  mlir::Value isNaN = mlir::arith::AndIOp::create(
+      builder, loc, expOnes,
+      mlir::arith::XOrIOp::create(
+          builder, loc, fracZero,
+          mlir::arith::ConstantOp::create(builder, loc, builder.getI1Type(),
+                                          builder.getBoolAttr(true))));
+  mlir::Value isInf =
+      mlir::arith::AndIOp::create(builder, loc, expOnes, fracZero);
+  mlir::Value isZero =
+      mlir::arith::AndIOp::create(builder, loc, expZero, fracZero);
+
+  // Class indices, as numbered by the table above genIsFPClass:
+  //   0 sNaN  1 qNaN  2 -Inf  3 -normal  4 -subnormal  5 -zero
+  //   6 +zero 7 +subnormal    8 +normal  9 +Inf
+  // The negative and positive entries mirror about 11, which is why the sign
+  // only has to flip an index rather than select a second tree.
+  auto konst = [&](int v) {
+    return builder.createIntegerConstant(loc, i32, v);
+  };
+  mlir::Value posIdx = mlir::arith::SelectOp::create(
+      builder, loc, isInf, konst(9),
+      mlir::arith::SelectOp::create(
+          builder, loc, isZero, konst(6),
+          mlir::arith::SelectOp::create(builder, loc, expZero, konst(7),
+                                        konst(8))));
+  mlir::Value idx = mlir::arith::SelectOp::create(
+      builder, loc, isNeg,
+      mlir::arith::SubIOp::create(builder, loc, konst(11), posIdx), posIdx);
+  idx = mlir::arith::SelectOp::create(
+      builder, loc, isNaN,
+      mlir::arith::SelectOp::create(builder, loc, quiet, konst(1), konst(0)),
+      idx);
+
+  // (fpclass >> idx) & 1
+  mlir::Value bit = mlir::arith::AndIOp::create(
+      builder, loc,
+      mlir::arith::ShRUIOp::create(builder, loc, konst(fpclass), idx),
+      konst(1));
+  return cmp(mlir::arith::CmpIPredicate::ne, bit, konst(0));
 }
 
 /// FLOOR or CEILING of a REAL(32), as a REAL(32).
@@ -5661,6 +5872,15 @@ mlir::Value IntrinsicLibrary::genIsFPClass(mlir::Type resultType,
                                            int fpclass) {
   assert(args.size() == 1);
   mlir::Type i1Ty = builder.getI1Type();
+  // REAL(32) is an i256, which LLVM::IsFPClass would read as a float of a type
+  // it does not have. Classify from the encoding instead. Routing it through
+  // here rather than at each caller means IEEE_IS_FINITE, IEEE_IS_NAN,
+  // IEEE_IS_NEGATIVE and IEEE_IS_NORMAL are covered together with the internal
+  // uses inside IEEE_MAX/MIN, IEEE_RINT, IEEE_REM and the ordered compares.
+  if (isOctaType(args[0].getType())) {
+    mlir::Value isfpclass = genOctaIsFPClass(builder, loc, args[0], fpclass);
+    return builder.createConvert(loc, resultType, isfpclass);
+  }
   mlir::Value isfpclass =
       mlir::LLVM::IsFPClass::create(builder, loc, i1Ty, args[0], fpclass);
   return builder.createConvert(loc, resultType, isfpclass);
@@ -5744,13 +5964,22 @@ mlir::Value IntrinsicLibrary::genIeeeClass(mlir::Type resultType,
 
   assert(args.size() == 1);
   mlir::Value realVal = args[0];
-  mlir::FloatType realType = mlir::dyn_cast<mlir::FloatType>(realVal.getType());
-  const unsigned intWidth = realType.getWidth();
+  // REAL(32) arrives as its own bit pattern, so there is no float type to
+  // interrogate and nothing to bitcast. Everything below this point works off
+  // `width` and `intVal`, and the index it builds indexes the same
+  // kind-independent runtime table.
+  const bool isOcta = isOctaType(realVal.getType());
+  mlir::FloatType realType =
+      isOcta ? nullptr : mlir::dyn_cast<mlir::FloatType>(realVal.getType());
+  const unsigned width = isOcta ? 256 : realType.getWidth();
+  const unsigned intWidth = width;
   mlir::Type intType = builder.getIntegerType(intWidth);
   mlir::Value intVal =
-      mlir::arith::BitcastOp::create(builder, loc, intType, realVal);
+      isOcta ? realVal
+             : mlir::arith::BitcastOp::create(builder, loc, intType, realVal)
+                   .getResult();
   llvm::StringRef tableName = RTNAME_STRING(IeeeClassTable);
-  uint64_t highSignificandSize = (realType.getWidth() == 80) + 1;
+  uint64_t highSignificandSize = (width == 80) + 1;
 
   // Get masks and shift counts.
   mlir::Value signShift, highSignificandShift, exponentMask, lowSignificandMask;
@@ -5777,7 +6006,7 @@ mlir::Value IntrinsicLibrary::genIeeeClass(mlir::Type resultType,
         llvm::APInt::getLowBitsSet(intWidth, lowSignificandSize);
     lowSignificandMask = createIntegerConstantAPI(lowSignificandMaskAPI);
   };
-  switch (realType.getWidth()) {
+  switch (width) {
   case 16:
     if (realType.isF16()) {
       // kind=2: 1 sign bit, 5 exponent bits, 10 significand bits
@@ -5799,6 +6028,9 @@ mlir::Value IntrinsicLibrary::genIeeeClass(mlir::Type resultType,
     break;
   case 128: // kind=16: 1 sign bit, 15 exponent bits, 112 significand bits
     getMasksAndShifts(128, 15, 112);
+    break;
+  case 256: // kind=32: 1 sign bit, 19 exponent bits, 236 significand bits
+    getMasksAndShifts(256, 19, 236);
     break;
   default:
     llvm_unreachable("unknown real type");
@@ -5994,6 +6226,19 @@ IntrinsicLibrary::genIeeeCopySign(mlir::Type resultType,
   assert(args.size() == 2);
   mlir::Value xRealVal = args[0];
   mlir::Value yRealVal = args[1];
+  // REAL(32): clear X's sign bit and set it from Y's. Only the same-kind
+  // specific exists, so both arguments are i256 together or neither is.
+  if (isOctaType(xRealVal.getType())) {
+    assert(isOctaType(yRealVal.getType()) &&
+           "mixed-kind IEEE_COPY_SIGN with REAL(32) is not provided");
+    llvm::APInt signBitV = llvm::APInt::getOneBitSet(256, 255);
+    mlir::Value signBit = genOctaConstant(builder, loc, signBitV);
+    mlir::Value magnitude = mlir::arith::AndIOp::create(
+        builder, loc, xRealVal, genOctaConstant(builder, loc, ~signBitV));
+    mlir::Value sign =
+        mlir::arith::AndIOp::create(builder, loc, yRealVal, signBit);
+    return mlir::arith::OrIOp::create(builder, loc, magnitude, sign);
+  }
   mlir::FloatType xRealType =
       mlir::dyn_cast<mlir::FloatType>(xRealVal.getType());
   mlir::FloatType yRealType =
@@ -6287,6 +6532,67 @@ mlir::Value IntrinsicLibrary::genIeeeLogb(mlir::Type resultType,
   //                 : ieee_copy_sign(X, 1.0) // +infinity or NaN
   assert(args.size() == 1);
   mlir::Value realVal = args[0];
+  // REAL(32) takes a dedicated route rather than branches threaded through the
+  // width-generic code below, which bitcasts, compares with arith.cmpf and
+  // converts an integer exponent to a float - three things an i256 cannot do.
+  // liboctamath already answers the hard part: octa_exponent is Fortran's
+  // EXPONENT, which is the unbiased exponent plus one, and it is defined for
+  // subnormals too, so the denormal ctlz branch below has no counterpart here.
+  if (isOctaType(realVal.getType())) {
+    mlir::Type i1Ty = builder.getI1Type();
+    mlir::Type i64 = builder.getIntegerType(64);
+    mlir::Type i256 = builder.getIntegerType(256);
+    mlir::Value isZero = genIsFPClass(i1Ty, args, zeroTest);
+    auto zeroIf = fir::IfOp::create(builder, loc, i256, isZero,
+                                    /*withElseRegion=*/true);
+    // X is zero: -infinity, and divide-by-zero is raised.
+    builder.setInsertionPointToStart(&zeroIf.getThenRegion().front());
+    genRaiseExcept(_FORTRAN_RUNTIME_IEEE_DIVIDE_BY_ZERO);
+    llvm::APInt negInf(256, 0);
+    negInf.insertBits(llvm::APInt(64, 0xFFFFF00000000000ULL), 192);
+    fir::ResultOp::create(builder, loc, genOctaConstant(builder, loc, negInf));
+
+    builder.setInsertionPointToStart(&zeroIf.getElseRegion().front());
+    mlir::Value isFinite = genIsFPClass(i1Ty, args, finiteTest);
+    auto finiteIf = fir::IfOp::create(builder, loc, i256, isFinite,
+                                      /*withElseRegion=*/true);
+    // X is finite and non-zero: EXPONENT(X) - 1, widened exactly.
+    builder.setInsertionPointToStart(&finiteIf.getThenRegion().front());
+    mlir::Value expo = genOctaModel(builder, loc, "octa_exponent", realVal, {},
+                                    /*resultIsInteger=*/true);
+    mlir::Value unbiased = mlir::arith::SubIOp::create(
+        builder, loc, expo,
+        builder.createIntegerConstant(loc, expo.getType(), 1));
+    mlir::Type ref = fir::ReferenceType::get(i256);
+    mlir::func::FuncOp conv = builder.getNamedFunction("octa_from_int64");
+    if (!conv) {
+      conv = builder.createFunction(loc, "octa_from_int64",
+                                    builder.getFunctionType({ref, i64}, {}));
+      conv->setAttr(
+          fir::getSymbolAttrName(),
+          mlir::StringAttr::get(builder.getContext(), "octa_from_int64"));
+      conv->setAttr(fir::FIROpsDialect::getFirRuntimeAttrName(),
+                    builder.getUnitAttr());
+    }
+    mlir::Value slot = fir::AllocaOp::create(builder, loc, i256);
+    fir::CallOp::create(
+        builder, loc, conv,
+        mlir::ValueRange{slot, builder.createConvert(loc, i64, unbiased)});
+    fir::ResultOp::create(builder, loc,
+                          fir::LoadOp::create(builder, loc, slot).getResult());
+
+    // X is infinity or NaN: IEEE_COPY_SIGN(X, 1.0), i.e. +infinity or NaN.
+    builder.setInsertionPointToStart(&finiteIf.getElseRegion().front());
+    mlir::Value absX = mlir::arith::AndIOp::create(
+        builder, loc, realVal,
+        genOctaConstant(builder, loc, ~llvm::APInt::getOneBitSet(256, 255)));
+    fir::ResultOp::create(builder, loc, absX);
+
+    builder.setInsertionPointToEnd(&zeroIf.getElseRegion().front());
+    fir::ResultOp::create(builder, loc, finiteIf.getResult(0));
+    builder.setInsertionPointAfter(zeroIf);
+    return zeroIf.getResult(0);
+  }
   mlir::FloatType realType = mlir::dyn_cast<mlir::FloatType>(realVal.getType());
   int bitWidth = realType.getWidth();
   mlir::Type intType = builder.getIntegerType(realType.getWidth());
@@ -6434,22 +6740,62 @@ mlir::Value IntrinsicLibrary::genIeeeMaxMin(mlir::Type resultType,
   assert(args.size() == 2);
   mlir::Value x = args[0];
   mlir::Value y = args[1];
+  mlir::Type i1Ty = builder.getI1Type();
+  // REAL(32) has no arith.cmpf, no math.copysign and no float zero, but the
+  // decision tree below is the same one. Rather than keep a second copy of it,
+  // the four operations that differ are taken through these lambdas.
+  const bool isOcta = isOctaType(resultType);
+  auto absOf = [&](mlir::Value v) -> mlir::Value {
+    if (isOcta)
+      return mlir::arith::AndIOp::create(
+          builder, loc, v,
+          genOctaConstant(builder, loc, ~llvm::APInt::getOneBitSet(256, 255)));
+    mlir::Value zero = builder.createRealZeroConstant(loc, resultType);
+    return mlir::math::CopySignOp::create(builder, loc, v, zero);
+  };
+  auto ordered = [&](mlir::arith::CmpFPredicate p, mlir::Value a,
+                     mlir::Value b) -> mlir::Value {
+    if (isOcta) {
+      mlir::arith::CmpIPredicate ip = p == mlir::arith::CmpFPredicate::OLT
+                                          ? mlir::arith::CmpIPredicate::slt
+                                      : p == mlir::arith::CmpFPredicate::OGT
+                                          ? mlir::arith::CmpIPredicate::sgt
+                                          : mlir::arith::CmpIPredicate::eq;
+      return genOctaCmp(builder, loc, a, b, ip);
+    }
+    return mlir::arith::CmpFOp::create(builder, loc, p, a, b);
+  };
+  auto notNaN = [&](mlir::Value v) -> mlir::Value {
+    if (isOcta)
+      return mlir::arith::XOrIOp::create(builder, loc,
+                                         genIsFPClass(i1Ty, v, nanTest),
+                                         builder.createBool(loc, true));
+    return mlir::arith::CmpFOp::create(builder, loc,
+                                       mlir::arith::CmpFPredicate::ORD, v, v);
+  };
+  auto quietNaN = [&]() -> mlir::Value {
+    if (isOcta) {
+      llvm::APInt qnan(256, 0);
+      qnan.insertBits(llvm::APInt(64, 0x7FFFF80000000000ULL), 192);
+      return genOctaConstant(builder, loc, qnan);
+    }
+    return genQNan(resultType);
+  };
+
   mlir::Value x1, y1; // X or ABS(X), Y or ABS(Y)
   if constexpr (isMag) {
-    mlir::Value zero = builder.createRealZeroConstant(loc, resultType);
-    x1 = mlir::math::CopySignOp::create(builder, loc, x, zero);
-    y1 = mlir::math::CopySignOp::create(builder, loc, y, zero);
+    x1 = absOf(x);
+    y1 = absOf(y);
   } else {
     x1 = x;
     y1 = y;
   }
-  mlir::Type i1Ty = builder.getI1Type();
   mlir::arith::CmpFPredicate pred;
   mlir::Value cmp, result, resultIsX, resultIsY;
 
   // X1 < Y1 -- MAX result is Y; MIN result is X.
   pred = mlir::arith::CmpFPredicate::OLT;
-  cmp = mlir::arith::CmpFOp::create(builder, loc, pred, x1, y1);
+  cmp = ordered(pred, x1, y1);
   auto ifOp1 = fir::IfOp::create(builder, loc, resultType, cmp, true);
   builder.setInsertionPointToStart(&ifOp1.getThenRegion().front());
   result = isMax ? y : x;
@@ -6458,7 +6804,7 @@ mlir::Value IntrinsicLibrary::genIeeeMaxMin(mlir::Type resultType,
   // X1 > Y1 -- MAX result is X; MIN result is Y.
   builder.setInsertionPointToStart(&ifOp1.getElseRegion().front());
   pred = mlir::arith::CmpFPredicate::OGT;
-  cmp = mlir::arith::CmpFOp::create(builder, loc, pred, x1, y1);
+  cmp = ordered(pred, x1, y1);
   auto ifOp2 = fir::IfOp::create(builder, loc, resultType, cmp, true);
   builder.setInsertionPointToStart(&ifOp2.getThenRegion().front());
   result = isMax ? x : y;
@@ -6467,7 +6813,7 @@ mlir::Value IntrinsicLibrary::genIeeeMaxMin(mlir::Type resultType,
   // X1 == Y1 -- MAX favors a positive result; MIN favors a negative result.
   builder.setInsertionPointToStart(&ifOp2.getElseRegion().front());
   pred = mlir::arith::CmpFPredicate::OEQ;
-  cmp = mlir::arith::CmpFOp::create(builder, loc, pred, x1, y1);
+  cmp = ordered(pred, x1, y1);
   auto ifOp3 = fir::IfOp::create(builder, loc, resultType, cmp, true);
   builder.setInsertionPointToStart(&ifOp3.getThenRegion().front());
   resultIsX = isMax ? genIsFPClass(i1Ty, x, positiveTest)
@@ -6478,16 +6824,14 @@ mlir::Value IntrinsicLibrary::genIeeeMaxMin(mlir::Type resultType,
   // X or Y or both are NaNs -- result may be X, Y, or a qNaN
   builder.setInsertionPointToStart(&ifOp3.getElseRegion().front());
   if constexpr (isNum) {
-    pred = mlir::arith::CmpFPredicate::ORD; // check for a non-NaN
-    resultIsX = mlir::arith::CmpFOp::create(builder, loc, pred, x, x);
-    resultIsY = mlir::arith::CmpFOp::create(builder, loc, pred, y, y);
+    resultIsX = notNaN(x);
+    resultIsY = notNaN(y);
   } else {
     resultIsX = resultIsY = builder.createBool(loc, false);
   }
   result = mlir::arith::SelectOp::create(
       builder, loc, resultIsX, x,
-      mlir::arith::SelectOp::create(builder, loc, resultIsY, y,
-                                    genQNan(resultType)));
+      mlir::arith::SelectOp::create(builder, loc, resultIsY, y, quietNaN()));
   mlir::Value hasSNaNOp = mlir::arith::OrIOp::create(
       builder, loc, genIsFPClass(builder.getI1Type(), args[0], snanTest),
       genIsFPClass(builder.getI1Type(), args[1], snanTest));
@@ -6515,7 +6859,10 @@ IntrinsicLibrary::genIeeeQuietCompare(mlir::Type resultType,
       builder, loc, genIsFPClass(builder.getI1Type(), args[0], snanTest),
       genIsFPClass(builder.getI1Type(), args[1], snanTest));
   mlir::Value res =
-      mlir::arith::CmpFOp::create(builder, loc, pred, args[0], args[1]);
+      isOctaType(args[0].getType())
+          ? genOctaComparePred(builder, loc, pred, args[0], args[1])
+          : mlir::arith::CmpFOp::create(builder, loc, pred, args[0], args[1])
+                .getResult();
   genRaiseExcept(_FORTRAN_RUNTIME_IEEE_INVALID, hasSNaNOp);
   return fir::ConvertOp::create(builder, loc, resultType, res);
 }
@@ -6763,6 +7110,18 @@ mlir::Value IntrinsicLibrary::genIeeeRem(mlir::Type resultType,
   assert(args.size() == 2);
   mlir::Value x = args[0];
   mlir::Value y = args[1];
+  // REAL(32): octa_remainder is the same construction libm's remainder() is,
+  // and is exact, so the underflow guard below still applies but the widening
+  // dance does not - there is nothing wider to widen to.
+  if (isOctaType(resultType)) {
+    mlir::Value underflow = mlir::arith::AndIOp::create(
+        builder, loc, genIsFPClass(builder.getI1Type(), x, subnormalTest),
+        genIsFPClass(builder.getI1Type(), y, infiniteTest));
+    mlir::Value result =
+        genOctaExactBinary(builder, loc, "octa_remainder", x, y);
+    genRaiseExcept(_FORTRAN_RUNTIME_IEEE_UNDERFLOW, underflow);
+    return result;
+  }
   if (mlir::dyn_cast<mlir::FloatType>(resultType).getWidth() < 32) {
     mlir::Type f32Ty = mlir::Float32Type::get(builder.getContext());
     x = fir::ConvertOp::create(builder, loc, f32Ty, x);
@@ -6789,6 +7148,34 @@ mlir::Value IntrinsicLibrary::genIeeeRint(mlir::Type resultType,
   // integral value.
   assert(args.size() == 2);
   mlir::Value a = args[0];
+  // REAL(32): octa_rint takes the mode as an argument rather than reading the
+  // hardware mode, since binary256 arithmetic never touches the FPU control
+  // word. When ROUND is absent the current mode is read and translated; when
+  // present it is used directly, and no set/restore of the hardware mode is
+  // needed because nothing downstream consults it.
+  if (isOctaType(resultType)) {
+    mlir::Type i32 = builder.getI32Type();
+    mlir::Value mode;
+    if (isStaticallyPresent(args[1])) {
+      auto [field, ignore] = getFieldRef(builder, loc, args[1]);
+      mode = builder.createConvert(loc, i32,
+                                   fir::LoadOp::create(builder, loc, field));
+    } else {
+      mode = fir::CallOp::create(builder, loc,
+                                 fir::factory::getLlvmGetRounding(builder))
+                 .getResult(0);
+    }
+    mlir::Value result = genOctaRint(builder, loc, a, mode);
+    if (!isStaticallyPresent(args[1])) {
+      // IEEE_INEXACT when the value was not already whole. octa_cmp answers
+      // this without an arith.cmpf, and an unordered pair (a NaN) is not
+      // inexact, which is what its separate unordered output preserves.
+      mlir::Value differs =
+          genOctaCmp(builder, loc, a, result, mlir::arith::CmpIPredicate::ne);
+      genRaiseExcept(_FORTRAN_RUNTIME_IEEE_INEXACT, differs);
+    }
+    return result;
+  }
   mlir::func::FuncOp getRound = fir::factory::getLlvmGetRounding(builder);
   mlir::func::FuncOp setRound = fir::factory::getLlvmSetRounding(builder);
   mlir::Value mode;
@@ -6893,7 +7280,10 @@ IntrinsicLibrary::genIeeeSignalingCompare(mlir::Type resultType,
   assert(args.size() == 2);
   mlir::Value hasNaNOp = genIeeeUnordered(mlir::Type{}, args);
   mlir::Value res =
-      mlir::arith::CmpFOp::create(builder, loc, pred, args[0], args[1]);
+      isOctaType(args[0].getType())
+          ? genOctaComparePred(builder, loc, pred, args[0], args[1])
+          : mlir::arith::CmpFOp::create(builder, loc, pred, args[0], args[1])
+                .getResult();
   genRaiseExcept(_FORTRAN_RUNTIME_IEEE_INVALID, hasNaNOp);
   return fir::ConvertOp::create(builder, loc, resultType, res);
 }
@@ -6904,6 +7294,15 @@ mlir::Value IntrinsicLibrary::genIeeeSignbit(mlir::Type resultType,
   // Check if the sign bit of arg X is set.
   assert(args.size() == 1);
   mlir::Value realVal = args[0];
+  // REAL(32) already is its own bit pattern, so the sign is the top bit and
+  // there is nothing to bitcast. dyn_cast to FloatType below would return null
+  // and getWidth() would then dereference it.
+  if (isOctaType(realVal.getType())) {
+    mlir::Value zero = genOctaConstant(builder, loc, llvm::APInt(256, 0));
+    mlir::Value neg = mlir::arith::CmpIOp::create(
+        builder, loc, mlir::arith::CmpIPredicate::slt, realVal, zero);
+    return builder.createConvert(loc, resultType, neg);
+  }
   mlir::FloatType realType = mlir::dyn_cast<mlir::FloatType>(realVal.getType());
   int bitWidth = realType.getWidth();
   if (realType == mlir::BFloat16Type::get(builder.getContext())) {
@@ -7045,6 +7444,16 @@ IntrinsicLibrary::genIeeeUnordered(mlir::Type resultType,
   // Check if REAL args X or Y or both are (signaling or quiet) NaNs.
   // If there is no result type return an i1 result.
   assert(args.size() == 2);
+  // REAL(32) has no arith.cmpf, so ask the classifier directly. This also
+  // covers the null-resultType case, which the mixed-type path below asserts
+  // against.
+  if (isOctaType(args[0].getType()) || isOctaType(args[1].getType())) {
+    mlir::Type i1Ty = builder.getI1Type();
+    mlir::Value res = mlir::arith::OrIOp::create(
+        builder, loc, genIsFPClass(i1Ty, args[0], nanTest),
+        genIsFPClass(i1Ty, args[1], nanTest));
+    return resultType ? builder.createConvert(loc, resultType, res) : res;
+  }
   if (args[0].getType() == args[1].getType()) {
     mlir::Value res = mlir::arith::CmpFOp::create(
         builder, loc, mlir::arith::CmpFPredicate::UNO, args[0], args[1]);
@@ -7068,14 +7477,20 @@ mlir::Value IntrinsicLibrary::genIeeeValue(mlir::Type resultType,
   // A compiler generated call has one argument:
   //  - arg[0] is an index constant
   assert(args.size() == 1 || args.size() == 2);
-  mlir::FloatType realType = mlir::dyn_cast<mlir::FloatType>(resultType);
-  int bitWidth = realType.getWidth();
+  // REAL(32) is its own bit pattern: the table below is built and indexed
+  // exactly as for the hardware kinds, but the final bitcast is a no-op and is
+  // skipped, since there is no float type to cast to.
+  const bool isOcta = isOctaType(resultType);
+  mlir::FloatType realType =
+      isOcta ? nullptr : mlir::dyn_cast<mlir::FloatType>(resultType);
+  int bitWidth = isOcta ? 256 : realType.getWidth();
   mlir::Type intType = builder.getIntegerType(bitWidth);
   mlir::Type valueTy = bitWidth <= 64 ? intType : builder.getIntegerType(64);
   constexpr int tableSize = _FORTRAN_RUNTIME_IEEE_OTHER_VALUE + 1;
   mlir::Type tableTy = fir::SequenceType::get(tableSize, valueTy);
-  std::string tableName = RTNAME_STRING(IeeeValueTable_) +
-                          std::to_string(realType.isBF16() ? 3 : bitWidth >> 3);
+  std::string tableName =
+      RTNAME_STRING(IeeeValueTable_) +
+      std::to_string((!isOcta && realType.isBF16()) ? 3 : bitWidth >> 3);
   if (!builder.getNamedGlobal(tableName)) {
     llvm::SmallVector<mlir::Attribute, tableSize> values;
     auto insert = [&](std::int64_t v) {
@@ -7165,6 +7580,23 @@ mlir::Value IntrinsicLibrary::genIeeeValue(mlir::Type resultType,
       /* IEEE_POSITIVE_NORMAL    */ insert(0x3fff000000000000); // 1.0
       /* IEEE_POSITIVE_INF       */ insert(0x7fff000000000000);
       break;
+    case 256:
+      // kind=32: 1 sign bit, 19 exponent bits, 236 significand bits.
+      // 64 high order bits; 192 low order bits are 0. Within this word the
+      // sign is bit 63 and the biased exponent occupies bits 62..44, so the
+      // all-ones exponent is 0x7FFFF and the bias 0x3FFFF, which is the same
+      // constant genOctaOne uses to build 1.0.
+      /* IEEE_SIGNALING_NAN      */ insert(0x7ffff40000000000);
+      /* IEEE_QUIET_NAN          */ insert(0x7ffff80000000000);
+      /* IEEE_NEGATIVE_INF       */ insert(0xfffff00000000000);
+      /* IEEE_NEGATIVE_NORMAL    */ insert(0xbffff00000000000);
+      /* IEEE_NEGATIVE_SUBNORMAL */ insert(0x8000080000000000);
+      /* IEEE_NEGATIVE_ZERO      */ insert(0x8000000000000000);
+      /* IEEE_POSITIVE_ZERO      */ insert(0x0000000000000000);
+      /* IEEE_POSITIVE_SUBNORMAL */ insert(0x0000080000000000);
+      /* IEEE_POSITIVE_NORMAL    */ insert(0x3ffff00000000000); // 1.0
+      /* IEEE_POSITIVE_INF       */ insert(0x7ffff00000000000);
+      break;
     default:
       llvm_unreachable("unknown real type");
     }
@@ -7194,6 +7626,8 @@ mlir::Value IntrinsicLibrary::genIeeeValue(mlir::Type resultType,
     bits = mlir::arith::ShLIOp::create(
         builder, loc, builder.createConvert(loc, intType, bits),
         builder.createIntegerConstant(loc, intType, bitWidth - 64));
+  if (isOcta)
+    return bits;
   return mlir::arith::BitcastOp::create(builder, loc, realType, bits);
 }
 

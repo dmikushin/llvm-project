@@ -171,21 +171,29 @@ module ieee_arithmetic
 #define SPECIFICS_L(G) \
   G(1) G(2) G(4) G(8)
 
+! Kind 32 (IEEE binary256) is lowered as an opaque 256-bit value with every
+! operation a call into liboctamath, so it is available on every target and
+! needs no configure-time gate the way kind 16 does.
+!
+! It is added to the one-argument list in full. The two- and three-argument
+! lists get only the same-kind entry: a mixed-kind IEEE_COPY_SIGN, IEEE_REM or
+! IEEE_UNORDERED between kind 32 and a hardware kind is not provided, and is
+! recorded as a limit rather than silently resolving to something narrower.
 #if FLANG_SUPPORT_R16
 #if __x86_64__
 #define SPECIFICS_R(G) \
-  G(2) G(3) G(4) G(8) G(10) G(16)
+  G(2) G(3) G(4) G(8) G(10) G(16) G(32)
 #else
 #define SPECIFICS_R(G) \
-  G(2) G(3) G(4) G(8) G(16)
+  G(2) G(3) G(4) G(8) G(16) G(32)
 #endif
 #else
 #if __x86_64__
 #define SPECIFICS_R(G) \
-  G(2) G(3) G(4) G(8) G(10)
+  G(2) G(3) G(4) G(8) G(10) G(32)
 #else
 #define SPECIFICS_R(G) \
-  G(2) G(3) G(4) G(8)
+  G(2) G(3) G(4) G(8) G(32)
 #endif
 #endif
 
@@ -238,27 +246,27 @@ module ieee_arithmetic
   G(4,2) G(4,3) G(4,4) G(4,8) G(4,10) G(4,16) \
   G(8,2) G(8,3) G(8,4) G(8,8) G(8,10) G(8,16) \
   G(10,2) G(10,3) G(10,4) G(10,8) G(10,10) G(10,16) \
-  G(16,2) G(16,3) G(16,4) G(16,8) G(16,10) G(16,16)
+  G(16,2) G(16,3) G(16,4) G(16,8) G(16,10) G(16,16) G(32,32)
 #define SPECIFICS_rRR(G) \
   G(2,2,2) G(2,2,3) G(4,2,4) G(8,2,8) G(10,2,10) G(16,2,16) \
   G(2,3,2) G(3,3,3) G(4,3,4) G(8,3,8) G(10,3,10) G(16,3,16) \
   G(4,4,2) G(4,4,3) G(4,4,4) G(8,4,8) G(10,4,10) G(16,4,16) \
   G(8,8,2) G(8,8,3) G(8,8,4) G(8,8,8) G(10,8,10) G(16,8,16) \
   G(10,10,2) G(10,10,3) G(10,10,4) G(10,10,8) G(10,10,10) G(16,10,16) \
-  G(16,16,2) G(16,16,3) G(16,16,4) G(16,16,8) G(16,16,10) G(16,16,16)
+  G(16,16,2) G(16,16,3) G(16,16,4) G(16,16,8) G(16,16,10) G(16,16,16) G(32,32,32)
 #else
 #define SPECIFICS_RR(G) \
   G(2,2) G(2,3) G(2,4) G(2,8) G(2,16) \
   G(3,2) G(3,3) G(3,4) G(3,8) G(3,16) \
   G(4,2) G(4,3) G(4,4) G(4,8) G(4,16) \
   G(8,2) G(8,3) G(8,4) G(8,8) G(8,16) \
-  G(16,2) G(16,3) G(16,4) G(16,8) G(16,16)
+  G(16,2) G(16,3) G(16,4) G(16,8) G(16,16) G(32,32)
 #define SPECIFICS_rRR(G) \
   G(2,2,2) G(2,2,3) G(4,2,4) G(8,2,8) G(16,2,16) \
   G(2,3,2) G(3,3,3) G(4,3,4) G(8,3,8) G(16,3,16) \
   G(4,4,2) G(4,4,3) G(4,4,4) G(8,4,8) G(16,4,16) \
   G(8,8,2) G(8,8,3) G(8,8,4) G(8,8,8) G(16,8,16) \
-  G(16,16,2) G(16,16,3) G(16,16,4) G(16,16,8) G(16,16,16)
+  G(16,16,2) G(16,16,3) G(16,16,4) G(16,16,8) G(16,16,16) G(32,32,32)
 #endif
 #else
 #if __x86_64__
@@ -267,24 +275,24 @@ module ieee_arithmetic
   G(3,2) G(3,3) G(3,4) G(3,8) G(3,10) \
   G(4,2) G(4,3) G(4,4) G(4,8) G(4,10) \
   G(8,2) G(8,3) G(8,4) G(8,8) G(8,10) \
-  G(10,2) G(10,3) G(10,4) G(10,8) G(10,10)
+  G(10,2) G(10,3) G(10,4) G(10,8) G(10,10) G(32,32)
 #define SPECIFICS_rRR(G) \
   G(2,2,2) G(2,2,3) G(4,2,4) G(8,2,8) G(10,2,10) \
   G(2,3,2) G(3,3,3) G(4,3,4) G(8,3,8) G(10,3,10) \
   G(4,4,2) G(4,4,3) G(4,4,4) G(8,4,8) G(10,4,10) \
   G(8,8,2) G(8,8,3) G(8,8,4) G(8,8,8) G(10,8,10) \
-  G(10,10,2) G(10,10,3) G(10,10,4) G(10,10,8) G(10,10,10)
+  G(10,10,2) G(10,10,3) G(10,10,4) G(10,10,8) G(10,10,10) G(32,32,32)
 #else
 #define SPECIFICS_RR(G) \
   G(2,2) G(2,3) G(2,4) G(2,8) \
   G(3,2) G(3,3) G(3,4) G(3,8) \
   G(4,2) G(4,3) G(4,4) G(4,8) \
-  G(8,2) G(8,3) G(8,4) G(8,8)
+  G(8,2) G(8,3) G(8,4) G(8,8) G(32,32)
 #define SPECIFICS_rRR(G) \
   G(2,2,2) G(2,2,3) G(4,2,4) G(8,2,8) \
   G(2,3,2) G(3,3,3) G(4,3,4) G(8,3,8) \
   G(4,4,2) G(4,4,3) G(4,4,4) G(8,4,8) \
-  G(8,8,2) G(8,8,3) G(8,8,4) G(8,8,8)
+  G(8,8,2) G(8,8,3) G(8,8,4) G(8,8,8) G(32,32,32)
 #endif
 #endif
 
