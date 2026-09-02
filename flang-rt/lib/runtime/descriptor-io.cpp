@@ -699,6 +699,21 @@ RT_API_ATTRS int DescriptorIoTicket<DIR>::Begin(WorkQueue &workQueue) {
       case 16:
         any = FormattedRealIO<16, DIR>(io_, instance_);
         break;
+#if !defined(RT_DEVICE_COMPILATION)
+      // REAL(32) is binary256. Reaching it here is what makes namelist work:
+      // the runtime walks a namelist group itself, reading each item's
+      // descriptor, so the compiler-side paths that handle list-directed and
+      // explicitly formatted REAL(32) never get a chance to intervene. Without
+      // this case a namelist containing one aborted with "not yet implemented:
+      // REAL(KIND=32) in formatted IO", and did so from inside the runtime, so
+      // IOSTAT never saw it either.
+      //
+      // Excluded from the device for the reason its conversions are: 128 KiB
+      // of digit array per conversion is not something a GPU thread can spend.
+      case 32:
+        any = FormattedRealIO<32, DIR>(io_, instance_);
+        break;
+#endif
       default:
         handler.Crash(
             "not yet implemented: REAL(KIND=%d) in formatted IO", kind);

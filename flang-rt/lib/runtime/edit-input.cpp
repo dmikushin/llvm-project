@@ -7,6 +7,12 @@
 //===----------------------------------------------------------------------===//
 
 #include "edit-input.h"
+// For EditBuffer. The scratch this file needs for a decimal scan is sized by
+// the same rule as the one the output side needs for a conversion, and at
+// binary256 both cross the threshold where an inline array stops being
+// reasonable. Reusing the class keeps one threshold rather than two that can
+// drift apart.
+#include "edit-output.h"
 #include "flang-rt/runtime/namelist.h"
 #include "flang-rt/runtime/utf.h"
 #include "flang/Common/optional.h"
@@ -839,7 +845,15 @@ RT_API_ATTRS bool EditCommonRealInput(
   static constexpr int maxDigits{
       common::MaxDecimalConversionDigits(binaryPrecision)};
   static constexpr int bufferSize{maxDigits + 18};
-  char buffer[bufferSize];
+  // 11581 bytes at binary128 and every kind below it, so those keep the inline
+  // array they have always had. 183484 at binary256, which is why this cannot
+  // stay on the stack. Note that the namelist round trip does not reach here:
+  // TryFastPathRealDecimalInput converts those fields itself. This is the path
+  // taken when the fast one declines - a field split across records, blanks as
+  // zeros, a comma for the decimal point - and it would otherwise put 180 KiB
+  // on the stack of each such read.
+  EditBuffer<static_cast<std::size_t>(bufferSize)> scratch;
+  char *buffer{scratch.data()};
   auto scanned{ScanRealInput(buffer, maxDigits + 2, io, edit)};
   int got{scanned.got};
   if (got >= maxDigits + 2) {
@@ -1258,6 +1272,13 @@ template RT_API_ATTRS bool EditRealInput<10>(
 // TODO: double/double
 template RT_API_ATTRS bool EditRealInput<16>(
     IoStatementState &, const DataEdit &, void *);
+#if !defined(RT_DEVICE_COMPILATION)
+// binary256, for the same reason the output side is instantiated at 32: a
+// namelist item is read by the runtime, which never returns to the call site
+// that would otherwise convert it.
+template RT_API_ATTRS bool EditRealInput<32>(
+    IoStatementState &, const DataEdit &, void *);
+#endif
 
 template RT_API_ATTRS bool EditCharacterInput(
     IoStatementState &, const DataEdit &, char *, std::size_t);

@@ -532,8 +532,18 @@ template ConversionToBinaryResult<64> ConvertToBinary<64>(
     const char *&, enum FortranRounding, const char *end);
 template ConversionToBinaryResult<113> ConvertToBinary<113>(
     const char *&, enum FortranRounding, const char *end);
-#if !defined(RT_DEVICE_COMPILATION) && !defined(FLANG_RT_BUILD)
-// binary256; see the note beside ConvertToDecimal<237>.
+#if !defined(RT_DEVICE_COMPILATION)
+// binary256. This excluded flang-rt as well until namelist needed it, and the
+// exclusion was right for as long as it lasted: REAL(32) input was converted
+// at the call site, exactly as output was, so the runtime never performed this
+// direction. A namelist group is walked by the runtime, which reads each
+// item's descriptor and never returns to the call site, so the conversion has
+// to be where the walk is.
+//
+// The storage is the same seam ConvertToDecimal<237> uses -
+// DecimalDigitStorageAllocate, defined once per library - so this brings no
+// new dependency with it; see the note beside that instantiation. The device
+// stays excluded for its own reason rather than by inheritance.
 template ConversionToBinaryResult<237> ConvertToBinary<237>(
     const char *&, enum FortranRounding, const char *end);
 #endif

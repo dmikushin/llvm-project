@@ -68,6 +68,10 @@ extern template RT_API_ATTRS bool EditRealInput<10>(
 // TODO: double/double
 extern template RT_API_ATTRS bool EditRealInput<16>(
     IoStatementState &, const DataEdit &, void *);
+#if !defined(RT_DEVICE_COMPILATION)
+extern template RT_API_ATTRS bool EditRealInput<32>(
+    IoStatementState &, const DataEdit &, void *);
+#endif
 
 extern template RT_API_ATTRS bool EditCharacterInput(
     IoStatementState &, const DataEdit &, char *, std::size_t);
