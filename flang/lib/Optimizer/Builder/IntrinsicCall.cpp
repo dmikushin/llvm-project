@@ -1959,6 +1959,83 @@ static mlir::Value genOctaNorm2(fir::FirOpBuilder &builder, mlir::Location loc,
                                           /*isUnordered=*/false)[0];
 }
 
+/// NORM2 over one dimension of a REAL(32) array.
+///
+/// The result is rank n-1: one reduction per output element, each over the
+/// single contracted extent. The accumulation is the same hypot chain the
+/// total case uses, called through genOctaBin rather than rewritten, because
+/// two spellings of one recurrence can disagree in the last place and the
+/// disagreement would appear only with DIM - the half nobody looks at.
+///
+/// There is no runtime kernel to fall back to: the runtime's NORM2 is
+/// templated over a C++ element type and binary256 has none, so this form
+/// reached ApplyFloatingPointKind and aborted *after the program had started*.
+/// Measured before the change: norm2(m) printed while norm2(m,1) died at run
+/// time.
+///
+/// The result is written into a temporary rather than produced as an
+/// hlfir.elemental, because NORM2 has no HLFIR operation - it is lowered
+/// straight from here - and this function's caller declares what it returns,
+/// which requires memory. An elemental's expression value fails that
+/// assertion rather than being converted.
+static fir::ExtendedValue
+genOctaNorm2Dim(fir::FirOpBuilder &builder, mlir::Location loc,
+                hlfir::Entity array, unsigned dim) {
+  llvm::SmallVector<mlir::Value> extents =
+      hlfir::genExtentsVector(loc, builder, array);
+  const unsigned rank = extents.size();
+  const unsigned axis = dim - 1;
+  mlir::Type idxTy = builder.getIndexType();
+  mlir::Type eleTy = builder.getIntegerType(256);
+
+  llvm::SmallVector<mlir::Value> resExtents;
+  for (unsigned k = 0; k < rank; ++k)
+    if (k != axis)
+      resExtents.push_back(extents[k]);
+
+  llvm::SmallVector<int64_t> resShapeTy(resExtents.size(),
+                                        fir::SequenceType::getUnknownExtent());
+  mlir::Value temp = builder.createTemporary(
+      loc, fir::SequenceType::get(resShapeTy, eleTy), resExtents);
+  // fir.array_coor, not fir.coordinate_of: the extents are not known at
+  // compile time, and coordinate_of refuses those above rank 1. Rank 2 with
+  // DIM happened to work through it because the result was rank 1 - a rank-3
+  // argument is what showed the difference.
+  mlir::Value resShape = builder.genShape(loc, resExtents);
+
+  // One reduction per output element. The outer nest walks the result, the
+  // inner one contracts the removed axis.
+  auto outer = [&](mlir::Location l, fir::FirOpBuilder &b,
+                   mlir::ValueRange outIdx,
+                   mlir::ValueRange) -> llvm::SmallVector<mlir::Value> {
+    llvm::SmallVector<mlir::Value> inits{genOctaZero(b, l)};
+    auto body = [&](mlir::Location bl, fir::FirOpBuilder &bb,
+                    mlir::ValueRange inner,
+                    mlir::ValueRange acc) -> llvm::SmallVector<mlir::Value> {
+      // Put the contracted loop's index back at the axis it came from.
+      llvm::SmallVector<mlir::Value> full;
+      for (unsigned k = 0, o = 0; k < rank; ++k)
+        full.push_back(k == axis ? inner[0] : outIdx[o++]);
+      hlfir::Entity elem = hlfir::loadElementAt(bl, bb, array, full);
+      return {genOctaBin(bb, bl, "octa_hypot", acc[0], elem)};
+    };
+    // A zero-extent contraction leaves the zero seed, which is NORM2 of an
+    // empty set, so nothing is reconciled afterwards.
+    mlir::Value v = hlfir::genLoopNestWithReductions(
+        l, b, {extents[axis]}, inits, body, /*isUnordered=*/false)[0];
+
+    mlir::Value addr = fir::ArrayCoorOp::create(
+        b, l, fir::ReferenceType::get(eleTy), temp, resShape,
+        /*slice=*/mlir::Value{}, outIdx, /*typeparams=*/mlir::ValueRange{});
+    fir::StoreOp::create(b, l, v, addr);
+    return {};
+  };
+  hlfir::genLoopNestWithReductions(loc, builder, resExtents, /*inits=*/{},
+                                   outer, /*isUnordered=*/true);
+
+  return fir::ArrayBoxValue{temp, resExtents};
+}
+
 /// FINDLOC over a REAL(32) array, as a loop carrying the subscripts of the
 /// match. There is no runtime kernel: the runtime's are templated over a C++
 /// element type binary256 does not have.
@@ -8777,14 +8854,23 @@ IntrinsicLibrary::genNorm2(mlir::Type resultType,
 
   // REAL(32) has no runtime kernel - the runtime's NORM2 is templated over a
   // C++ element type and binary256 has none, which is what the abort in
-  // mlirTypeToIntrinsicFortran was reporting. The total case becomes a loop of
-  // liboctamath calls here, in lowering, so it does not depend on which passes
-  // run. NORM2 with DIM still takes the runtime path and still fails there by
-  // name, which is the honest outcome for something unimplemented.
+  // mlirTypeToIntrinsicFortran was reporting. Both forms become loops of
+  // liboctamath calls here, in lowering, so neither depends on which passes
+  // run.
   if (fir::unwrapSequenceType(fir::unwrapPassByRefType(array.getType()))
           .isInteger(256)) {
     if (absentDim || rank == 1)
       return genOctaNorm2(builder, loc, hlfir::Entity{array});
+    // The contracted axis has to be known while the nest is built, so a
+    // non-constant DIM is refused here rather than in the runtime. Failing
+    // before the program starts is the point: the DIM form used to compile and
+    // then abort partway through a run.
+    std::optional<llvm::APInt> cstDim =
+        fir::getIntIfConstant(fir::getBase(args[1]));
+    if (!cstDim)
+      TODO(loc, "NORM2 with a non-constant DIM over REAL(KIND=32)");
+    return genOctaNorm2Dim(builder, loc, hlfir::Entity{array},
+                           static_cast<unsigned>(cstDim->getSExtValue()));
   }
 
   // If dim argument is absent or the array is rank 1, then the result is
