@@ -334,25 +334,29 @@ template ConversionToDecimalResult ConvertToDecimal<64>(char *, std::size_t,
 template ConversionToDecimalResult ConvertToDecimal<113>(char *, std::size_t,
     enum DecimalConversionFlags, int, enum FortranRounding,
     BinaryFloatingPointNumber<113>);
-#if !defined(RT_DEVICE_COMPILATION) && !defined(FLANG_RT_BUILD)
-// binary256, for the compiler only.
+#if !defined(RT_DEVICE_COMPILATION)
+// binary256, for the compiler and for the host runtime.
 //
-// The digit array is 128 KiB, which crosses the threshold in
-// big-radix-floating-point.h where the storage moves to the heap. The compiler
-// can allocate; flang-rt cannot - it is freestanding and supplies no
-// operator new[]/delete[] - so instantiating this there compiles and then
-// fails to link every Fortran program with "undefined reference to
-// operator new[]". Note where that failure lands: at the link of a *user*
-// program, never at the build of the runtime, so a clean flang-rt build does
-// not clear it.
+// The digit array is 131208 bytes, which crosses the 64 KiB threshold in
+// big-radix-floating-point.h where the storage stops being a member array.
+// That used to exclude flang-rt, because the storage above the threshold came
+// from operator new[] and the freestanding runtime has none: instantiating it
+// here compiled and then failed to link every Fortran program with "undefined
+// reference to operator new[]". Note where that failure landed - at the link
+// of a *user* program, never at the build of the runtime - so a clean flang-rt
+// build did not clear it.
 //
-// The device exclusion is the same rule for the same reason, and the
-// static_assert in big-radix-floating-point.h enforces it rather than trusting
-// this list to stay as it is.
+// The storage now comes from DecimalDigitStorageAllocate, which each library
+// defines for itself, so the runtime allocates the same way it allocates
+// everything else. The runtime needs this: it is what lets RealOutputEditing
+// be instantiated at binary256, and so what makes E, F, ES, EN and D work on a
+// REAL(32). Without it those descriptors reach a value that was formatted at
+// the call site and handed over as characters, and abort with "Data edit
+// descriptor 'E' may not be used with a CHARACTER data item".
 //
-// Nothing in the runtime needs this yet: REAL(32) has no output formatting.
-// Giving it one requires a buffer strategy that does not allocate, not simply
-// removing this guard.
+// The device is still excluded, and for the original reason rather than by
+// inheritance: a GPU thread cannot spare 128 KiB of allocation per conversion.
+// REAL(32) is not offloaded.
 template ConversionToDecimalResult ConvertToDecimal<237>(char *, std::size_t,
     enum DecimalConversionFlags, int, enum FortranRounding,
     BinaryFloatingPointNumber<237>);

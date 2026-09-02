@@ -85,6 +85,17 @@ bool IODEF(OutputReal64)(Cookie cookie, double x) {
   return FormattedScalarRealOutput<8>(*cookie, x, "OutputReal64");
 }
 
+// REAL(32). The value arrives by address because binary256 has no C scalar
+// type; the 32 bytes are its IEEE interchange encoding. Everything after the
+// load is the ordinary path, which is the point of doing it this way.
+bool IODEF(OutputReal256)(Cookie cookie, const void *x) {
+  using Real = typename RealOutputEditing<32>::BinaryFloatingPoint;
+  typename Real::RawType raw;
+  static_assert(sizeof raw == 32);
+  Fortran::runtime::memcpy(&raw, x, sizeof raw);
+  return FormattedScalarRealOutput<32>(*cookie, Real{raw}, "OutputReal256");
+}
+
 template <int KIND,
     typename REAL = typename RealOutputEditing<KIND>::BinaryFloatingPoint>
 inline RT_API_ATTRS bool FormattedScalarComplexOutput(
@@ -114,6 +125,22 @@ bool IODEF(OutputComplex32)(Cookie cookie, float re, float im) {
 
 bool IODEF(OutputComplex64)(Cookie cookie, double re, double im) {
   return FormattedScalarComplexOutput<8>(*cookie, re, im, "OutputComplex64");
+}
+
+// COMPLEX(32). Both components arrive by address, for the same reason as
+// OutputReal256, and the parts are then edited by the ordinary path - which
+// matters here beyond the descriptors, because list-directed complex output
+// has to emit the parenthesised form as one unit, and that logic lives in
+// FormattedScalarComplexOutput rather than in anything a call site could
+// reproduce by concatenating two formatted strings.
+bool IODEF(OutputComplex256)(Cookie cookie, const void *re, const void *im) {
+  using Real = typename RealOutputEditing<32>::BinaryFloatingPoint;
+  typename Real::RawType reRaw, imRaw;
+  static_assert(sizeof reRaw == 32);
+  Fortran::runtime::memcpy(&reRaw, re, sizeof reRaw);
+  Fortran::runtime::memcpy(&imRaw, im, sizeof imRaw);
+  return FormattedScalarComplexOutput<32>(
+      *cookie, Real{reRaw}, Real{imRaw}, "OutputComplex256");
 }
 
 bool IODEF(OutputAscii)(Cookie cookie, const char *x, std::size_t length) {

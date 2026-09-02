@@ -57,13 +57,12 @@ static constexpr std::uint64_t TenToThe(int power) {
 // flang/Decimal/decimal.h stop at binary128, so no device instantiation ever
 // crosses the threshold.
 //
-// Above it the storage moves to the heap. That path is for the compiler only.
-// It is NOT available in flang-rt, on a device or on the host: the runtime is
-// freestanding and supplies no operator new[]/delete[]. An earlier version of
-// this comment claimed the host runtime had them, and that mistake cost a
-// link failure in every Fortran program once binary256 was instantiated - the
-// runtime itself built cleanly, because undefined symbols in an archive are
-// only a problem when something links against it.
+// Above it the storage is allocated, through the seam described below. That
+// path is now available in flang-rt as well as in the compiler, which is what
+// lets the runtime instantiate the conversion at binary256 and so apply the
+// numeric edit descriptors to REAL(32). It was previously the compiler's
+// alone, because the heap path used operator new[] and the freestanding
+// runtime has none.
 template <typename D, int N, bool Heap = (sizeof(D) * N > 64 * 1024)>
 class DigitStorage {
 public:
@@ -74,37 +73,39 @@ private:
   D d_[N];
 };
 
-template <typename D, int N> class DigitStorage<D, N, true> {
-#if defined(RT_DEVICE_COMPILATION) || defined(FLANG_RT_BUILD)
-  // The argument that no runtime instantiation crosses the threshold - because
-  // the explicit instantiations stop at binary128 - is true today and is
-  // exactly the kind of reasoning a later edit invalidates without noticing.
-  // Adding ConvertToDecimal<237> is the natural next step when REAL(32)
-  // arrives; it was taken, and it put an operator new[] into flang-rt, where
-  // every compile succeeded and every link of a user program failed.
-  //
-  // So the argument is a check rather than a comment. sizeof(D) == 0 is
-  // dependent, so this fires when the heap specialisation is instantiated for
-  // the runtime and not before.
-  static_assert(sizeof(D) == 0,
-      "BigRadixFloatingPointNumber was instantiated at a precision whose digit "
-      "array exceeds the inline threshold, while compiling flang-rt. The "
-      "runtime is freestanding and has no operator new[], so this compiles and "
-      "then fails to link every Fortran program. Either keep the runtime "
-      "instantiations below the threshold, or give this class a "
-      "caller-supplied buffer.");
-#endif
+// Above the threshold the storage is obtained through the two functions below
+// rather than with operator new[].
+//
+// The earlier version of this class used new[] and asserted that flang-rt must
+// never instantiate it, because the runtime is freestanding and supplies no
+// operator new[]: adding ConvertToDecimal<237> for REAL(32) had put one into
+// flang-rt, where every compile succeeded and every link of a user program
+// failed. That assertion named its own way out - "give this class a
+// caller-supplied buffer" - and this is it, in the form that does not have to
+// be threaded through four layers of signature.
+//
+// DecimalDigitStorageAllocate/Free are declared here and defined once per
+// library that links this header: flang/lib/Decimal/digit-storage.cpp uses
+// malloc for the compiler, flang-rt/lib/runtime/digit-storage.cpp uses the
+// runtime's own AllocateMemoryOrCrash. flang-rt compiles binary-to-decimal.cpp
+// and decimal-to-binary.cpp from this directory but not digit-storage.cpp, so
+// each binary gets exactly one definition. That is a link seam, not a build
+// fork: there is one code path here and it is the same in both.
+RT_API_ATTRS void *DecimalDigitStorageAllocate(std::size_t bytes);
+RT_API_ATTRS void DecimalDigitStorageFree(void *);
 
+template <typename D, int N> class DigitStorage<D, N, true> {
 public:
-  DigitStorage() : d_{new D[N]} {}
-  ~DigitStorage() { delete[] d_; }
+  RT_API_ATTRS DigitStorage()
+      : d_{static_cast<D *>(DecimalDigitStorageAllocate(N * sizeof(D)))} {}
+  RT_API_ATTRS ~DigitStorage() { DecimalDigitStorageFree(d_); }
   // Never copied: the enclosing class's copy constructor copies the live
   // digits one by one into freshly constructed storage. Deleting these makes
   // that a compile error rather than a double free if anyone changes it.
   DigitStorage(const DigitStorage &) = delete;
   DigitStorage &operator=(const DigitStorage &) = delete;
-  D &operator[](int j) { return d_[j]; }
-  const D &operator[](int j) const { return d_[j]; }
+  RT_API_ATTRS D &operator[](int j) { return d_[j]; }
+  RT_API_ATTRS const D &operator[](int j) const { return d_[j]; }
 
 private:
   D *d_;

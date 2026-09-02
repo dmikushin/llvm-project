@@ -275,6 +275,25 @@ bool IODECL(InputComplex64)(Cookie, double[2]);
 bool IODECL(OutputCharacter)(Cookie, const char *, std::size_t, int kind = 1);
 bool IODECL(OutputAscii)(Cookie, const char *, std::size_t);
 
+// Output a REAL(32) under an edit descriptor, as data rather than as
+// characters.
+//
+// The value is passed by address because binary256 has no C scalar type; the
+// 32 bytes are the IEEE interchange encoding, little-endian, exactly as the
+// blob lowering holds them. The runtime converts and edits it with the same
+// RealOutputEditing machinery every other real kind uses, so E, F, ES, EN, D
+// and G all behave as the standard says without any of that logic existing
+// twice.
+//
+// This is what OutputPreformattedReal below could not do. A preformatted
+// string cannot answer an edit descriptor, because the descriptor decides how
+// many significant digits to ask for and with which rounding, and it decides
+// that only after the runtime has parsed a format that may itself be a
+// run-time character expression. edit-output.cpp calls ConvertToDecimal at six
+// different sites with six different answers.
+bool IODECL(OutputReal256)(Cookie, const void *);
+bool IODECL(OutputComplex256)(Cookie, const void *, const void *);
+
 // Output a numeric field that the compiler has already converted to
 // characters, as a single item that is not split across records.
 //

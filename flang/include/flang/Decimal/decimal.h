@@ -91,6 +91,13 @@ extern template RT_API_ATTRS ConversionToDecimalResult ConvertToDecimal<64>(
 extern template RT_API_ATTRS ConversionToDecimalResult ConvertToDecimal<113>(
     char *, size_t, enum DecimalConversionFlags, int, enum FortranRounding,
     BinaryFloatingPointNumber<113>);
+#if !defined(RT_DEVICE_COMPILATION)
+// binary256. Excluded from the device build only; see the definition in
+// binary-to-decimal.cpp for why the host runtime is now included.
+extern template RT_API_ATTRS ConversionToDecimalResult ConvertToDecimal<237>(
+    char *, size_t, enum DecimalConversionFlags, int, enum FortranRounding,
+    BinaryFloatingPointNumber<237>);
+#endif
 
 template <int PREC> struct ConversionToBinaryResult {
   BinaryFloatingPointNumber<PREC> binary;

@@ -767,65 +767,37 @@ static bool isArrayReal32(const Fortran::lower::SomeExpr *expr) {
 /// here: COMPLEX(32) arrays, which still reach OutputDescriptor with a type
 /// code the runtime has no case for. REAL(32) arrays are handled by
 /// genOutputReal32Array.
-/// Format one binary256 value, held in `slot`, and emit it.
+/// Emit one binary256 value, held in `slot`, through the runtime.
 ///
-/// Factored out of genOutputReal32 so that the scalar and array paths cannot
-/// format differently. They are one piece of code, so a change to either is a
-/// change to both; two copies would eventually disagree about a digit, and the
-/// disagreement would only show on arrays, which nothing printed at all for
-/// the first day this type existed.
-static mlir::Value genOctaFormatAndEmit(fir::FirOpBuilder &builder,
+/// The value travels as data. The runtime loads the 32-byte interchange
+/// encoding, converts it with flang/lib/Decimal instantiated at precision 237,
+/// and applies whatever edit descriptor the format called for, using the same
+/// RealOutputEditing every other real kind uses.
+///
+/// It used to be formatted here instead, by liboctamath, and handed over as
+/// characters. That worked for list-directed output and could not be made to
+/// work for E, F, ES, EN or D: a numeric descriptor applied to a character
+/// item aborts with "Data edit descriptor 'E' may not be used with a CHARACTER
+/// data item". The reason is not that the connection was missed but that a
+/// string cannot answer the question - the descriptor chooses how many
+/// significant digits to request and with which rounding, and it chooses only
+/// after the runtime has parsed a format that may be a run-time character
+/// expression, so the compiler cannot know w and d in order to format ahead.
+///
+/// The objection that kept the conversion out of the runtime was that it would
+/// make every Fortran program link liboctamath. It does not: flang/lib/Decimal
+/// is flang's own arbitrary-precision conversion, and instantiating it at 237
+/// needs only BinaryFloatingPointNumber<237>, which is bit manipulation. What
+/// it did need was 128 KiB of digit array from a runtime that had no
+/// operator new[]; that is now supplied through DecimalDigitStorageAllocate.
+static mlir::Value genOutputReal256Call(fir::FirOpBuilder &builder,
                                         mlir::Location loc, mlir::Value cookie,
                                         mlir::Value slot) {
-  mlir::Type i256 = builder.getIntegerType(256);
-  mlir::Type i8 = builder.getIntegerType(8);
-  mlir::Type i32 = builder.getI32Type();
-  mlir::Type i64 = builder.getI64Type();
-
-  // The shortest decimal that reads back as the same binary256 value needs at
-  // most 73 significant digits, plus sign, point and exponent. 128 is chosen
-  // to leave that no way of being tight; octa_format reports a buffer it
-  // cannot fit rather than truncating, and the failure is checked below.
-  constexpr std::int64_t bufLen = 128;
-  mlir::Type bufTy = fir::SequenceType::get({bufLen}, i8);
-  mlir::Value buf = fir::AllocaOp::create(builder, loc, bufTy);
-  mlir::Value bufPtr =
-      builder.createConvert(loc, fir::ReferenceType::get(i8), buf);
-
-  mlir::FunctionType fmtTy = builder.getFunctionType(
-      {fir::ReferenceType::get(i8), i64, fir::ReferenceType::get(i256)}, {i32});
-  mlir::func::FuncOp fmtFunc = builder.getNamedFunction("octa_format");
-  if (!fmtFunc) {
-    fmtFunc = builder.createFunction(loc, "octa_format", fmtTy);
-    fmtFunc->setAttr(fir::FIROpsDialect::getFirRuntimeAttrName(),
-                     builder.getUnitAttr());
-  }
-  mlir::Value cap = builder.createIntegerConstant(loc, i64, bufLen);
-  mlir::Value len = fir::CallOp::create(builder, loc, fmtFunc,
-                                        mlir::ValueRange{bufPtr, cap, slot})
-                        .getResult(0);
-
-  // A negative length means the value could not be formatted. Clamping it to
-  // zero would print an empty field and look like a value that happens to be
-  // blank; the runtime's own error path is not reachable from here, so the
-  // honest minimum is to emit nothing rather than something wrong. The
-  // comparison is kept so that a future caller can see where to hang a
-  // diagnostic.
-  mlir::Value zero = builder.createIntegerConstant(loc, i32, 0);
-  mlir::Value ok32 = mlir::arith::CmpIOp::create(
-      builder, loc, mlir::arith::CmpIPredicate::sgt, len, zero);
-  mlir::Value safeLen =
-      mlir::arith::SelectOp::create(builder, loc, ok32, len, zero);
-  mlir::Value lenArg = builder.createConvert(loc, i64, safeLen);
-
   mlir::func::FuncOp outputFunc =
-      fir::runtime::getIORuntimeFunc<mkIOKey(OutputPreformattedReal)>(loc,
-                                                                     builder);
+      fir::runtime::getIORuntimeFunc<mkIOKey(OutputReal256)>(loc, builder);
   mlir::Type ptrArg = outputFunc.getFunctionType().getInput(1);
-  mlir::Type lenTy = outputFunc.getFunctionType().getInput(2);
   llvm::SmallVector<mlir::Value> args = {
-      cookie, builder.createConvert(loc, ptrArg, bufPtr),
-      builder.createConvert(loc, lenTy, lenArg)};
+      cookie, builder.createConvert(loc, ptrArg, slot)};
   return fir::CallOp::create(builder, loc, outputFunc, args).getResult(0);
 }
 
@@ -839,7 +811,7 @@ static void genOutputReal32(Fortran::lower::AbstractConverter &converter,
   mlir::Value value = fir::getBase(converter.genExprValue(loc, expr, stmtCtx));
   mlir::Value slot = fir::AllocaOp::create(builder, loc, i256);
   fir::StoreOp::create(builder, loc, value, slot);
-  ok = genOctaFormatAndEmit(builder, loc, cookie, slot);
+  ok = genOutputReal256Call(builder, loc, cookie, slot);
 }
 
 /// Emit list-directed output of a REAL(32) array, one element at a time.
@@ -905,7 +877,7 @@ static void genOutputReal32Array(Fortran::lower::AbstractConverter &converter,
   mlir::Value elem = fir::LoadOp::create(builder, loc, addr);
   mlir::Value slot = fir::AllocaOp::create(builder, loc, i256);
   fir::StoreOp::create(builder, loc, elem, slot);
-  genOctaFormatAndEmit(builder, loc, cookie, slot);
+  genOutputReal256Call(builder, loc, cookie, slot);
 
   builder.setInsertionPointAfter(loops.front());
   // `ok` is left as the caller set it. Threading a per-element status out of
@@ -914,15 +886,19 @@ static void genOutputReal32Array(Fortran::lower::AbstractConverter &converter,
   // item is the question the last element already answered.
 }
 
-/// Emit list-directed output of a scalar COMPLEX(32).
+/// Emit a scalar COMPLEX(32).
 ///
-/// Same reasoning as genOutputReal32 - the runtime has no decimal conversion
-/// at 237 bits - with the parts assembled into `(re,im)` here, which is what
-/// list-directed complex output looks like. Both parts go into one buffer and
-/// one OutputPreformattedReal call rather than three calls, so the value
-/// cannot be split across records: a binary256 pair is about 160 characters
-/// and would otherwise straddle the boundary, which is exactly how the real
-/// case first came out with its exponent severed.
+/// Both parts are handed to the runtime as data, which then edits them by the
+/// ordinary path. That is what makes E, F, ES, EN and D work on a COMPLEX(32),
+/// each component taking its own descriptor as the standard requires.
+///
+/// This replaced a version that formatted both parts here with liboctamath and
+/// assembled "(re,im)" into a single character buffer by hand, punctuation and
+/// all, so that the pair could not be split across records. None of that is
+/// needed now: list-directed complex output is one unit in
+/// FormattedScalarComplexOutput, which is where it belongs, and under an
+/// explicit format the two components are two separate edited fields - which
+/// the concatenated string could not have expressed at all.
 static void genOutputComplex32(Fortran::lower::AbstractConverter &converter,
                                mlir::Location loc, mlir::Value cookie,
                                const Fortran::lower::SomeExpr *expr,
@@ -930,83 +906,22 @@ static void genOutputComplex32(Fortran::lower::AbstractConverter &converter,
                                mlir::Value &ok) {
   fir::FirOpBuilder &builder = converter.getFirOpBuilder();
   mlir::Type i256 = builder.getIntegerType(256);
-  mlir::Type i8 = builder.getIntegerType(8);
-  mlir::Type i32 = builder.getI32Type();
-  mlir::Type i64 = builder.getI64Type();
-  mlir::Type idxTy = builder.getIndexType();
-
-  // Two values of up to 128 characters, three punctuation marks and room to
-  // spare. octa_format reports a buffer it cannot fit rather than truncating.
-  constexpr std::int64_t bufLen = 288;
-  constexpr std::int64_t partCap = 128;
-  mlir::Type bufTy = fir::SequenceType::get({bufLen}, i8);
-  mlir::Value buf = fir::AllocaOp::create(builder, loc, bufTy);
-
-  auto byteAt = [&](mlir::Value off) {
-    return fir::CoordinateOp::create(builder, loc,
-                                     fir::ReferenceType::get(i8), buf,
-                                     mlir::ValueRange{off});
-  };
-  auto putChar = [&](mlir::Value off, char c) {
-    mlir::Value ch = builder.createIntegerConstant(loc, i8, c);
-    fir::StoreOp::create(builder, loc, ch, byteAt(off));
-  };
-
-  mlir::FunctionType fmtTy = builder.getFunctionType(
-      {fir::ReferenceType::get(i8), i64, fir::ReferenceType::get(i256)}, {i32});
-  mlir::func::FuncOp fmtFunc = builder.getNamedFunction("octa_format");
-  if (!fmtFunc) {
-    fmtFunc = builder.createFunction(loc, "octa_format", fmtTy);
-    fmtFunc->setAttr(fir::FIROpsDialect::getFirRuntimeAttrName(),
-                     builder.getUnitAttr());
-  }
-  mlir::Value cap = builder.createIntegerConstant(loc, i64, partCap);
 
   mlir::Value value = fir::getBase(converter.genExprValue(loc, expr, stmtCtx));
   auto parts = fir::factory::Complex{builder, loc}.extractParts(value);
 
-  auto formatAt = [&](mlir::Value off, mlir::Value part) {
-    mlir::Value slot = fir::AllocaOp::create(builder, loc, i256);
-    fir::StoreOp::create(builder, loc, part, slot);
-    mlir::Value len =
-        fir::CallOp::create(builder, loc, fmtFunc,
-                            mlir::ValueRange{byteAt(off), cap, slot})
-            .getResult(0);
-    // A negative length means the value could not be formatted. Emitting
-    // nothing for it is the honest minimum here, as in the real case: a
-    // clamped zero would print a blank field that reads as a value.
-    mlir::Value zero32 = builder.createIntegerConstant(loc, i32, 0);
-    mlir::Value good = mlir::arith::CmpIOp::create(
-        builder, loc, mlir::arith::CmpIPredicate::sgt, len, zero32);
-    mlir::Value safe =
-        mlir::arith::SelectOp::create(builder, loc, good, len, zero32);
-    return builder.createConvert(loc, idxTy, safe);
-  };
+  mlir::Value reSlot = fir::AllocaOp::create(builder, loc, i256);
+  fir::StoreOp::create(builder, loc, parts.first, reSlot);
+  mlir::Value imSlot = fir::AllocaOp::create(builder, loc, i256);
+  fir::StoreOp::create(builder, loc, parts.second, imSlot);
 
-  mlir::Value zero = builder.createIntegerConstant(loc, idxTy, 0);
-  mlir::Value one = builder.createIntegerConstant(loc, idxTy, 1);
-  putChar(zero, '(');
-  mlir::Value reLen = formatAt(one, parts.first);
-  mlir::Value afterRe = mlir::arith::AddIOp::create(builder, loc, one, reLen);
-  putChar(afterRe, ',');
-  mlir::Value imStart =
-      mlir::arith::AddIOp::create(builder, loc, afterRe, one);
-  mlir::Value imLen = formatAt(imStart, parts.second);
-  mlir::Value afterIm =
-      mlir::arith::AddIOp::create(builder, loc, imStart, imLen);
-  putChar(afterIm, ')');
-  mlir::Value total = mlir::arith::AddIOp::create(builder, loc, afterIm, one);
-
-  mlir::Value bufPtr =
-      builder.createConvert(loc, fir::ReferenceType::get(i8), buf);
   mlir::func::FuncOp outputFunc =
-      fir::runtime::getIORuntimeFunc<mkIOKey(OutputPreformattedReal)>(loc,
-                                                                     builder);
-  mlir::Type ptrArg = outputFunc.getFunctionType().getInput(1);
-  mlir::Type lenTy = outputFunc.getFunctionType().getInput(2);
+      fir::runtime::getIORuntimeFunc<mkIOKey(OutputComplex256)>(loc, builder);
+  mlir::Type reArg = outputFunc.getFunctionType().getInput(1);
+  mlir::Type imArg = outputFunc.getFunctionType().getInput(2);
   llvm::SmallVector<mlir::Value> args = {
-      cookie, builder.createConvert(loc, ptrArg, bufPtr),
-      builder.createConvert(loc, lenTy, total)};
+      cookie, builder.createConvert(loc, reArg, reSlot),
+      builder.createConvert(loc, imArg, imSlot)};
   ok = fir::CallOp::create(builder, loc, outputFunc, args).getResult(0);
 }
 

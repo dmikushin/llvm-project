@@ -283,20 +283,21 @@ template <int KIND>
 RT_API_ATTRS decimal::ConversionToDecimalResult
 RealOutputEditing<KIND>::ConvertToDecimal(int significantDigits,
     enum decimal::FortranRounding rounding, int width, int flags) {
-  auto converted{decimal::ConvertToDecimal<binaryPrecision>(buffer_,
-      sizeof buffer_, static_cast<enum decimal::DecimalConversionFlags>(flags),
+  auto converted{decimal::ConvertToDecimal<binaryPrecision>(buffer_.data(),
+      buffer_.size(),
+      static_cast<enum decimal::DecimalConversionFlags>(flags),
       significantDigits, rounding, x_)};
   if (!converted.str) { // overflow
     io_.GetIoErrorHandler().Crash(
         "RealOutputEditing::ConvertToDecimal: buffer size %zd was insufficient",
-        sizeof buffer_);
+        buffer_.size());
   } else if (IsInfOrNaN(converted.str, converted.length) == 'I' &&
       converted.length <= 4 &&
       static_cast<int>(converted.length + 5) <= width) {
     // Emit "Infinity" rather than "Inf" (F'2023 13.7.2.3.2 p9), possibly signed
-    std::memcpy(buffer_, converted.str, converted.length);
-    std::memcpy(buffer_ + converted.length, "inity", 5);
-    converted.str = buffer_;
+    std::memcpy(buffer_.data(), converted.str, converted.length);
+    std::memcpy(buffer_.data() + converted.length, "inity", 5);
+    converted.str = buffer_.data();
     converted.length += 5;
   }
   return converted;
@@ -325,7 +326,7 @@ RT_API_ATTRS bool RealOutputEditing<KIND>::EditEorDOutput(
     } else { // E0
       flags |= decimal::Minimize;
       significantDigits =
-          sizeof buffer_ - 5; // sign, NUL, + 3 extra for EN scaling
+          buffer_.size() - 5; // sign, NUL, + 3 extra for EN scaling
     }
   }
   int zeroesAfterPoint{0};
@@ -454,7 +455,7 @@ RT_API_ATTRS bool RealOutputEditing<KIND>::EditFOutput(const DataEdit &edit) {
   if (editWidth == 0) { // "the processor selects the field width"
     if (!edit.digits.has_value()) { // F0
       flags |= decimal::Minimize;
-      fracDigits = sizeof buffer_ - 2; // sign & NUL
+      fracDigits = buffer_.size() - 2; // sign & NUL
     }
   }
   bool emitTrailingZeroes{!(flags & decimal::Minimize)};
@@ -485,7 +486,7 @@ RT_API_ATTRS bool RealOutputEditing<KIND>::EditFOutput(const DataEdit &edit) {
     if (expo > extraDigits && extraDigits >= 0 && canIncrease) {
       extraDigits = expo;
       if (!edit.digits.has_value()) { // F0
-        fracDigits = sizeof buffer_ - extraDigits - 2; // sign & NUL
+        fracDigits = buffer_.size() - extraDigits - 2; // sign & NUL
       }
       canIncrease = false; // only once
       continue;
@@ -676,14 +677,14 @@ RT_API_ATTRS auto RealOutputEditing<KIND>::ConvertToHexadecimal(
   }
   int len{0};
   if (x_.IsNegative()) {
-    buffer_[len++] = '-';
+    buffer_.data()[len++] = '-';
   } else if (flags & decimal::AlwaysSign) {
-    buffer_[len++] = '+';
+    buffer_.data()[len++] = '+';
   }
   auto fraction{x_.Fraction()};
   if (fraction == 0) {
-    buffer_[len++] = '0';
-    return {buffer_, len, 0};
+    buffer_.data()[len++] = '0';
+    return {buffer_.data(), len, 0};
   } else {
     // Ensure that the MSB is set.
     int expo{x_.UnbiasedExponent() - 3};
@@ -708,14 +709,14 @@ RT_API_ATTRS auto RealOutputEditing<KIND>::ConvertToHexadecimal(
         hexDigit = int(fraction << -shift) & 0xf;
       }
       if (hexDigit >= 10) {
-        buffer_[len++] = 'A' + hexDigit - 10;
+        buffer_.data()[len++] = 'A' + hexDigit - 10;
       } else {
-        buffer_[len++] = '0' + hexDigit;
+        buffer_.data()[len++] = '0' + hexDigit;
       }
       shift -= 4;
       remaining >>= 4;
     }
-    return {buffer_, len, expo};
+    return {buffer_.data(), len, expo};
   }
 }
 
@@ -998,6 +999,11 @@ template class RealOutputEditing<8>;
 template class RealOutputEditing<10>;
 // TODO: double/double
 template class RealOutputEditing<16>;
+#if !defined(RT_DEVICE_COMPILATION)
+// binary256. Host only: the conversion behind it allocates ~128 KiB per call,
+// which a GPU thread cannot spare, and REAL(32) is not offloaded.
+template class RealOutputEditing<32>;
+#endif
 
 template RT_API_ATTRS bool ListDirectedCharacterOutput(IoStatementState &,
     ListDirectedStatementState<Direction::Output> &, const char *,

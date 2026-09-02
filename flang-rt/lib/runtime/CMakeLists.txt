@@ -49,6 +49,7 @@ set(supported_sources
   derived.cpp
   descriptor-io.cpp
   descriptor.cpp
+  digit-storage.cpp
   dot-product-integer.cpp
   dot-product-real.cpp
   dot-product-complex.cpp
@@ -147,6 +148,7 @@ set(gpu_sources
   derived-api.cpp
   derived.cpp
   descriptor.cpp
+  digit-storage.cpp
   dot-product-integer.cpp
   dot-product-real.cpp
   dot-product-complex.cpp

@@ -20,12 +20,48 @@
 
 #include "flang-rt/runtime/format.h"
 #include "flang-rt/runtime/io-stmt.h"
+#include "flang-rt/runtime/memory.h"
+#include "flang-rt/runtime/terminator.h"
 #include "flang/Common/uint128.h"
 #include "flang/Decimal/decimal.h"
 
 namespace Fortran::runtime::io {
 
 RT_OFFLOAD_API_GROUP_BEGIN
+
+// Scratch for the decimal conversion, sized by the format.
+//
+// It is an ordinary member array up to a threshold, which is every kind
+// through binary128 - 11563 bytes at quad, so nothing changes for them. At
+// binary256 it is 183466, and RealOutputEditing is a local in the IO path, so
+// leaving it inline would put 180 KiB on the stack of every formatted write.
+// Above the threshold it is allocated instead, from the runtime's own
+// allocator. Same split, and for the same reason, as DigitStorage in
+// flang/lib/Decimal/big-radix-floating-point.h.
+template <std::size_t N, bool Allocate = (N > 64 * 1024)> class EditBuffer {
+public:
+  RT_API_ATTRS char *data() { return d_; }
+  static constexpr RT_API_ATTRS std::size_t size() { return N; }
+
+private:
+  char d_[N];
+};
+
+template <std::size_t N> class EditBuffer<N, true> {
+public:
+  RT_API_ATTRS EditBuffer() {
+    Terminator terminator{__FILE__, __LINE__};
+    d_ = static_cast<char *>(AllocateMemoryOrCrash(terminator, N));
+  }
+  RT_API_ATTRS ~EditBuffer() { FreeMemory(d_); }
+  EditBuffer(const EditBuffer &) = delete;
+  EditBuffer &operator=(const EditBuffer &) = delete;
+  RT_API_ATTRS char *data() { return d_; }
+  static constexpr RT_API_ATTRS std::size_t size() { return N; }
+
+private:
+  char *d_;
+};
 
 // I, B, O, Z, and G output editing for INTEGER.
 // The DataEdit reference is const here (and elsewhere in this header) so that
@@ -90,8 +126,9 @@ private:
       int flags);
 
   BinaryFloatingPoint x_;
-  char buffer_[BinaryFloatingPoint::maxDecimalConversionDigits +
-      EXTRA_DECIMAL_CONVERSION_SPACE];
+  EditBuffer<BinaryFloatingPoint::maxDecimalConversionDigits +
+      EXTRA_DECIMAL_CONVERSION_SPACE>
+      buffer_;
 };
 
 RT_API_ATTRS bool ListDirectedLogicalOutput(
@@ -150,6 +187,9 @@ extern template class RealOutputEditing<8>;
 extern template class RealOutputEditing<10>;
 // TODO: double/double
 extern template class RealOutputEditing<16>;
+#if !defined(RT_DEVICE_COMPILATION)
+extern template class RealOutputEditing<32>;
+#endif
 
 RT_OFFLOAD_API_GROUP_END
 
