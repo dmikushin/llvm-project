@@ -525,10 +525,12 @@ int getTypeCode(mlir::Type ty, const fir::KindMapping &kindMap) {
         // for one arrives here as an integer and must not be described as one.
         // Without this case the compiler aborts outright - measured, by
         // deleting it: `llvm_unreachable("unsupported integer type")` on any
-        // REAL(32) array. Which code is returned is not yet observable, because
-        // element size comes from the descriptor's byte length rather than from
-        // the type code and nothing reachable reads the code today; it becomes
-        // load-bearing as soon as formatted output, reductions or C interop do.
+        // REAL(32) array. The code returned is load-bearing, and only a check
+        // that reads back a descriptor *the compiler built* can see it: with
+        // this case returning CFI_type_float128 a REAL(32) array reaches C
+        // labelled REAL(16), while every audit that calls CFI_establish from C
+        // still passes - that exercises the runtime's code -> kind mapping and
+        // never arrives here. Measured in both directions.
         //
         // The mapping is unambiguous only because i256 has exactly one meaning
         // in FIR today: Fortran's widest integer kind is 16, so nothing else
