@@ -741,6 +741,25 @@ RT_API_ATTRS int DescriptorIoTicket<DIR>::Begin(WorkQueue &workQueue) {
       case 16:
         any = FormattedComplexIO<16, DIR>(io_, instance_);
         break;
+#if !defined(RT_DEVICE_COMPILATION)
+      // COMPLEX(32) is a pair of binary256, and needs nothing beyond this entry:
+      // FormattedComplexIO edits each part through RealOutputEditing<KIND> and
+      // EditRealInput<KIND>, both of which exist at 32 already - the first from
+      // the numeric edit descriptors, the second from the REAL(32) namelist
+      // work. Only the switch was missing.
+      //
+      // Without it a namelist holding one aborted from inside the runtime with
+      // "not yet implemented: COMPLEX(KIND=32) in formatted IO", after the
+      // group name and "Z=" had already been written. IOSTAT could not see it:
+      // Crash does not return, so the I/O statement never finished and the
+      // next statement never ran.
+      //
+      // Excluded from the device alongside its Real counterpart, and for the
+      // same reason - the conversions behind it want 128 KiB of digit array.
+      case 32:
+        any = FormattedComplexIO<32, DIR>(io_, instance_);
+        break;
+#endif
       default:
         handler.Crash(
             "not yet implemented: COMPLEX(KIND=%d) in formatted IO", kind);
